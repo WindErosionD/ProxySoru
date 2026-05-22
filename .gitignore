@@ -1,0 +1,191 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# Environments
+.env
+.env.*
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+/test.txt
+
+# =============================================================================
+# ProxySoru：本地敏感数据与运行时产物（默认不提交）
+# =============================================================================
+
+# 用户本地配置（从 ssrspeed_config.example.json 复制后修改；含代理账号、订阅 URL 等）
+ssrspeed_config.json
+ssrspeed_config.local.json
+ssrspeed_config.*.local.json
+
+# Mihomo 测速时自动写入，含节点 UUID / 密码 / plugin-opts
+config_mihomo.yaml
+config.yaml
+config.yml
+profiles/
+
+# 测速结果 JSON/图片/HTML（含节点名、IP、速度等）
+results/
+
+# 运行日志（可能含订阅 URL、节点摘要）
+logs/
+*.log
+
+# 便携包 / 内置 Python（体积大且为构建产物）
+python/
+PORTABLE_BUILD
+便携版说明.txt
+
+# 依赖安装缓存标记
+.ssrspeed_req.sha256
+
+# 本地保存的订阅 / Clash / GUI / 节点列表（-c 导入或手存）
+gui-config.json
+guiConfig.json
+proxies.yaml
+proxies.yml
+nodes.yaml
+nodes.yml
+nodes.json
+*.sub
+subscription*.txt
+subscription*.yaml
+subscription*.yml
+*-subscription.*
+sub.txt
+sub.yaml
+sub.yml
+link.txt
+links.txt
+*.list
+
+# 密钥 / 证书（若本地放置）
+*.pem
+*.key
+*.p12
+*.pfx
+
+# IDE（可能含本机路径、数据源）
+.idea/
+*.iml
+.vscode/
+!.vscode/extensions.json
+
+# 调试与临时文件（仅仓库根目录，勿误伤 __init__.py）
+/_*
+/_*.json
+/_*.txt
+/_*.bin
+/_*.log
+
+# 环境检测 / bootstrap 日志（根目录散落时）
+/pip_install_last.log
+/bootstrap_diag.txt
+/last_bootstrap.log

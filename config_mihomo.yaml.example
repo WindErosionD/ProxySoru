@@ -1,0 +1,16 @@
+mixed-port: 0
+port: 0
+socks-port: 10870
+allow-lan: false
+mode: rule
+log-level: warning
+# 测速热重载用
+external-controller: 127.0.0.1:9190
+secret: ""
+proxies: []
+proxy-groups:
+- name: SSRSpeed
+  type: select
+  proxies: []
+rules:
+- MATCH,SSRSpeed

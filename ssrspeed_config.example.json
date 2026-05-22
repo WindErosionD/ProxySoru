@@ -1,0 +1,210 @@
+{
+	"localAddress": "127.0.0.1",
+	"localPort": 1087,
+	"excludeRemarks": [],
+	"proxy": {
+		"enabled": false,
+		"address": "127.0.0.1",
+		"port": 1080,
+		"username": null,
+		"password": null
+	},
+	"dns": {
+		"enabled": true,
+		"subscription": true,
+		"inbound": true,
+		"doh_timeout_seconds": 5,
+		"doh_parallel": true,
+		"providers": ["cloudflare", "google", "quad9"]
+	},
+	"ntt": {
+		"enabled": true,
+		"internal_ip": "0.0.0.0",
+		"internal_port": 54320,
+		"stun_host": null,
+		"stun_port": 3478
+	},
+	"ping": false,
+	"gping": true,
+	"speed": true,
+	"method": "ST_ASYNC",
+	"StSpeed": true,
+	"netflix": true,
+	"hbo": true,
+	"disney": true,
+	"youtube": true,
+	"bahamut": true,
+	"chatgpt": true,
+	"claude": true,
+	"gemini": true,
+	"primevideo": true,
+	"tiktok": true,
+	"spotify": true,
+	"steam": true,
+	"ig_audio": true,
+	"topology": {
+		"enabled": false
+	},
+	"performance": {
+		"http_timeout": 5,
+		"subscription_http_timeout": 18,
+		"node_interval": 0.1,
+		"service_workers": 12,
+		"client_ready_poll": 0.2,
+		"client_ready_max_wait": 2.5,
+		"port_check_poll": 0.2,
+		"port_check_max_wait": 2,
+		"ping_max_total": 6,
+		"ping_max_fail": 2,
+		"speed_test_seconds": 8,
+		"aio_timeout_seconds": 12,
+		"aio_connect_timeout_seconds": 6,
+		"aio_read_timeout_seconds": 10,
+		"geo_parallel": true,
+		"speed_zero_retry": false,
+		"mihomo_api_host": "127.0.0.1",
+		"mihomo_api_port": 9190,
+		"mihomo_api_secret": "",
+		"mihomo_api_timeout": 5,
+		"mihomo_settle_seconds": 0.12,
+		"mihomo_hard_restart_every": 80
+	},
+	"exportResult": {
+		"hide_max_speed": false,
+		"filenameSuffix": "",
+		"font": "./resources/fonts/SourceHanSansCN-Medium.otf",
+		"colors": [
+			{
+				"name": "origin",
+				"colors": {
+					"4.0": [
+						102,
+						255,
+						102
+					],
+					"8.0": [
+						255,
+						255,
+						102
+					],
+					"16.0": [
+						255,
+						178,
+						102
+					],
+					"24.0": [
+						255,
+						102,
+						102
+					],
+					"32.0": [
+						226,
+						140,
+						255
+					],
+					"40.0": [
+						102,
+						204,
+						255
+					],
+					"50.0": [
+						102,
+						102,
+						255
+					]
+				}
+			},
+			{
+				"name": "poor",
+				"colors": {
+					"4.0": [
+						255,
+						215,
+						0
+					],
+					"8.0": [
+						255,
+						178,
+						1
+					],
+					"16.0": [
+						255,
+						0,
+						255
+					],
+					"24.0": [
+						64,
+						139,
+						255
+					],
+					"32.0": [
+						0,
+						100,
+						255
+					],
+					"40.0": [
+						19,
+						87,
+						191
+					],
+					"50.0": [
+						164,
+						53,
+						211
+					]
+				}
+			}
+		]
+	},
+	"fileDownload": {
+		"maxWorkers": 6,
+		"buffer": 4096,
+		"skipRuleMatch": false,
+		"rules": [
+			{
+				"mode": "match_isp",
+				"ISP": "Microsoft Corporation",
+				"tag": "Google"
+			},
+			{
+				"mode": "match_isp",
+				"ISP": "Google LLC",
+				"tag": "Default"
+			},
+			{
+				"mode": "match_location",
+				"countries": [
+					"TH"
+				],
+				"tag": "Google"
+			}
+		],
+		"downloadLinks": [
+			{
+				"link": "https://download.microsoft.com/download/7/A/8/7A84E002-6512-4506-A812-CA66FF6766D9/officeserversp2013-kb2880552-fullfile-x64-en-us.exe",
+				"fileSize": 1900,
+				"tag": "Default"
+			},
+			{
+				"link": "https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe",
+				"fileSize": 971,
+				"tag": "Google"
+			}
+		]
+	},
+	"webPageSimulation": {
+		"maxThread": 4,
+		"urls": [
+			"https://www.google.com.hk",
+			"https://www.youtube.com",
+			"https://www.bing.com",
+			"https://www.github.com",
+			"https://www.microsoft.com"
+		],
+		"cnUrls": [
+			"https://www.baidu.com",
+			"https://www.weibo.com",
+			"https://www.qq.com"
+		]
+	}
+}

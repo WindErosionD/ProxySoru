@@ -1,0 +1,14 @@
+wheel
+six
+colorlog
+pillow
+requests
+curl-cffi>=0.6.0
+requests[socks]
+pysocks
+pynat>=0.7.0
+pyyaml
+aiohttp
+aiohttp_socks
+beautifulsoup4
+selenium
