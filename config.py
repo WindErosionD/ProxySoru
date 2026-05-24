@@ -8,7 +8,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 # 项目根目录（与当前工作目录无关）；客户端二进制、运行时 yaml/json 应锚定此路径，便携版/快捷方式启动时 cwd 可能不是仓库根。
 PROJECT_ROOT = _ROOT
 
-__version__ = "0.3"
+__version__ = "0.32"
 
 config = {
 	"VERSION": __version__,

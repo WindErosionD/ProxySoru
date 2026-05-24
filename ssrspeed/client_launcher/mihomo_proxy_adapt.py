@@ -3,6 +3,7 @@
 
 import copy
 import logging
+import re
 from typing import Any, Dict
 
 logger = logging.getLogger("Sub")
@@ -232,6 +233,58 @@ def _v2ray_json_to_vmess(cfg: dict) -> dict:
 	return out
 
 
+def _is_ipv4(host: str) -> bool:
+	return bool(re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", (host or "").strip()))
+
+
+def _prefer_resolved_server(proxy: dict) -> None:
+	"""DoH/系统 DNS 预解析 server，避免 Mihomo 在污染 DNS 下连不上节点。"""
+	server = proxy.get("server")
+	if not isinstance(server, str) or not server.strip() or _is_ipv4(server):
+		return
+	try:
+		from ..utils.dns_resolve import resolve_ipv4_with_fallback
+
+		ip = resolve_ipv4_with_fallback(server.strip())
+	except Exception:
+		logger.debug("Pre-resolve server %s failed.", server, exc_info=True)
+		return
+	if ip and ip != "N/A" and _is_ipv4(ip):
+		logger.debug("Resolved proxy server %s -> %s", server, ip)
+		proxy["server"] = ip
+	elif not _is_ipv4(server):
+		logger.warning(
+			"Could not resolve proxy server %r; Mihomo will rely on built-in DNS.",
+			server,
+		)
+
+
+def _sanitize_mihomo_proxy(proxy: dict) -> dict:
+	"""去掉 Mihomo 不认识的字段，并统一 SS cipher/port。"""
+	out = copy.deepcopy(proxy)
+	for key in (
+		"server_port",
+		"local_address",
+		"local_port",
+		"remarks",
+		"group",
+		"run_type",
+	):
+		out.pop(key, None)
+	if out.get("type") == "ss":
+		if not out.get("cipher") and out.get("method"):
+			out["cipher"] = out.pop("method")
+		out.pop("method", None)
+	_ensure_port(out, out)
+	return out
+
+
+def _finalize_mihomo_proxy(proxy: dict) -> dict:
+	out = _sanitize_mihomo_proxy(proxy)
+	_prefer_resolved_server(out)
+	return out
+
+
 def _native_mihomo_strip(cfg: dict) -> dict:
 	out = copy.deepcopy(cfg)
 	out.pop("local_address", None)
@@ -288,22 +341,22 @@ def config_to_mihomo_proxy(cfg: dict) -> dict:
 		raise TypeError("config must be dict")
 
 	if "outbounds" in cfg and isinstance(cfg.get("outbounds"), list):
-		return _v2ray_json_to_vmess(cfg)
+		return _finalize_mihomo_proxy(_v2ray_json_to_vmess(cfg))
 
 	if cfg.get("run_type") == "client" and "remote_addr" in cfg:
-		return _trojan_json_to_proxy(cfg)
+		return _finalize_mihomo_proxy(_trojan_json_to_proxy(cfg))
 
 	t = (cfg.get("type") or "").lower()
 	if t in _MIHOMO_NATIVE_TYPES and "server" in cfg:
 		out = _native_mihomo_strip(cfg)
 		if t == "ss" and out.get("plugin"):
 			out["plugin"] = _normalize_ss_plugin_for_mihomo(str(out["plugin"]))
-		return out
+		return _finalize_mihomo_proxy(out)
 
 	if _is_ssr_style(cfg):
-		return _shadowsocksr_to_proxy(cfg)
+		return _finalize_mihomo_proxy(_shadowsocksr_to_proxy(cfg))
 
 	if _is_shadowsocks_style(cfg):
-		return _shadowsocks_to_proxy(cfg)
+		return _finalize_mihomo_proxy(_shadowsocks_to_proxy(cfg))
 
 	raise ValueError("无法识别节点配置类型，无法交给 Mihomo 运行。")

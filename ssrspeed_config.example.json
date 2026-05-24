@@ -42,6 +42,13 @@
 	"spotify": true,
 	"steam": true,
 	"ig_audio": true,
+	"ig_audio_probe_shortcodes": [
+		"DCchrGBJFYA",
+		"DIJfw-Iu6h4",
+		"ConUVfbgKEl",
+		"DVn-vNTCIfX",
+		"DI-stckPoqZ"
+	],
 	"topology": {
 		"enabled": false
 	},

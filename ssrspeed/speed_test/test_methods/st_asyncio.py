@@ -130,9 +130,11 @@ async def _fetch(url: str, sta: Statistics, host: str = "127.0.0.1", port: int =
 						break
 					await sta.record(len(chunk))
 	except (ClientOSError, ClientConnectorError, SocksError, SocksConnectionError, asyncio.TimeoutError, ConnectionResetError, OSError) as e:
-		logger.warning("Download worker failed via %s:%s: %s", host, port, e)
+		detail = str(e).strip() or e.__class__.__name__
+		logger.warning("Download worker failed via %s:%s: %s", host, port, detail)
 	except ClientError as e:
-		logger.warning("Download worker HTTP error via %s:%s: %s", host, port, e)
+		detail = str(e).strip() or e.__class__.__name__
+		logger.warning("Download worker HTTP error via %s:%s: %s", host, port, detail)
 	except Exception:
 		logger.exception("Download worker unexpected error via %s:%s", host, port)
 

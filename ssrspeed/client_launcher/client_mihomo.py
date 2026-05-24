@@ -39,6 +39,38 @@ def _api_secret() -> str:
 	return str(_perf().get("mihomo_api_secret", "") or "")
 
 
+_MIHOMO_DOH = {
+	"cloudflare": "https://cloudflare-dns.com/dns-query",
+	"google": "https://dns.google/dns-query",
+	"quad9": "https://dns.quad9.net/dns-query",
+}
+
+
+def _build_mihomo_dns() -> dict:
+	"""Mihomo 出站解析走 DoH，避免系统 DNS 污染导致节点域名无法解析、测速 0 MB/s。"""
+	dns_cfg = config.get("dns") or {}
+	if not dns_cfg.get("enabled", True):
+		return {}
+	order = dns_cfg.get("providers") or ["cloudflare", "google", "quad9"]
+	doh_urls = []
+	for name in order:
+		url = _MIHOMO_DOH.get(str(name).lower().strip())
+		if url and url not in doh_urls:
+			doh_urls.append(url)
+	if not doh_urls:
+		doh_urls = list(_MIHOMO_DOH.values())
+	return {
+		"dns": {
+			"enable": True,
+			"ipv6": False,
+			"enhanced-mode": "redir-host",
+			"default-nameserver": ["223.5.5.5", "119.29.29.29", "1.1.1.1"],
+			"nameserver": doh_urls,
+			"proxy-server-nameserver": doh_urls + ["223.5.5.5", "119.29.29.29"],
+		}
+	}
+
+
 def _probe_mihomo_version_line(binary: str) -> str:
 	for args in (("-v",), ("version",), ("--version",)):
 		try:
@@ -78,7 +110,7 @@ class Mihomo(BaseClient):
 
 	def __build_runtime_config(self, proxy_cfg: dict) -> dict:
 		proxy_name = proxy_cfg.get("name", proxy_cfg.get("server", "SSRSpeedNode"))
-		return {
+		runtime = {
 			"mixed-port": 0,
 			"port": 0,
 			"socks-port": config["localPort"],
@@ -97,6 +129,8 @@ class Mihomo(BaseClient):
 			],
 			"rules": ["MATCH,SSRSpeed"],
 		}
+		runtime.update(_build_mihomo_dns())
+		return runtime
 
 	def __find_binary(self):
 		if self._binary:
@@ -203,6 +237,16 @@ class Mihomo(BaseClient):
 			)
 		self._nodes_since_start = 0
 
+	def __wait_api_ready(self, label: str = "startup") -> None:
+		deadline = time.time() + max(self._api_timeout * 3, 8.0)
+		while time.time() < deadline:
+			if self._process and self._process.poll() is not None:
+				raise OSError("Mihomo exited during {}.".format(label))
+			if self.__api_ready():
+				return
+			time.sleep(0.1)
+		logger.warning("Mihomo API not ready after %s; continuing with port check.", label)
+
 	def __hard_restart(self, binary: str, proxy_cfg: dict):
 		logger.info("Mihomo hard restart (reload fallback or periodic refresh).")
 		self.stopClient()
@@ -212,14 +256,7 @@ class Mihomo(BaseClient):
 			proxy_cfg.get("server", "N/A"),
 			int(proxy_cfg.get("port", 0)),
 		)
-		deadline = time.time() + max(self._api_timeout * 3, 8.0)
-		while time.time() < deadline:
-			if self._process and self._process.poll() is not None:
-				raise OSError("Mihomo exited during startup.")
-			if self.__api_ready():
-				return
-			time.sleep(0.1)
-		logger.warning("Mihomo API not ready after hard restart; continuing with port check.")
+		self.__wait_api_ready("hard restart")
 
 	def __apply_node_config(self, proxy_cfg: dict, force_restart: bool = False):
 		binary = self.__find_binary()
@@ -247,6 +284,7 @@ class Mihomo(BaseClient):
 				proxy_cfg.get("server", "N/A"),
 				int(proxy_cfg.get("port", 0)),
 			)
+			self.__wait_api_ready("cold start")
 			return
 
 		if force_restart:

@@ -2,6 +2,17 @@
 
 测速程序**仅**通过本目录或系统 `PATH` 中的 **Mihomo / Clash Meta** 可执行文件承载所有协议；不再内置 Shadowsocks、V2Ray、Trojan 等独立客户端。
 
+## 仓库内置（Windows）
+
+本仓库已提交 **Windows amd64** 内核：
+
+| 文件 | 说明 |
+|------|------|
+| `mihomo.exe` | 测速程序默认使用的内核 |
+| `VERSION` | 对应上游 release 标签与资产名 |
+
+克隆仓库后**无需再单独下载** Mihomo（Windows）。Linux / macOS 请从 [MetaCubeX/mihomo Releases](https://github.com/MetaCubeX/mihomo/releases) 下载对应二进制，命名为 `clients/mihomo/mihomo` 并 `chmod +x`。
+
 ## 放置路径（按查找顺序）
 
 程序在 `PROJECT_ROOT`（仓库根）下依次查找：
@@ -15,7 +26,7 @@
 
 ## 版本与自检
 
-将官方发布的 **Mihomo** 或 **Clash Meta** 对应平台的可执行文件放入 `clients/mihomo/` 即可（本仓库便携目录默认名为 `mihomo.exe` / `mihomo`）。
+升级内核：从上游下载新版本，覆盖 `mihomo.exe`（或 `mihomo`），并更新 `VERSION`。
 
 在终端执行（以 Windows 为例）：
 
