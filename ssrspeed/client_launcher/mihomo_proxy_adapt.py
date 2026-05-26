@@ -63,6 +63,20 @@ def _parse_ss_plugin_opts(plugin: str, plugin_opts: str) -> Dict[str, Any]:
 	return opts
 
 
+_SS_CIPHER_ALIASES = {
+	"chacha20-poly1305": "chacha20-ietf-poly1305",
+	"chacha20_ietf_poly1305": "chacha20-ietf-poly1305",
+}
+
+
+def _normalize_ss_cipher(cipher: str) -> str:
+	c = (cipher or "").strip()
+	if not c:
+		return c
+	key = c.lower().replace("_", "-")
+	return _SS_CIPHER_ALIASES.get(key, c)
+
+
 def _normalize_ss_plugin_for_mihomo(plugin: str) -> str:
 	"""Mihomo/Clash Meta 使用 plugin: obfs，而非 simple-obfs / obfs-local。"""
 	p = (plugin or "").strip().lower()
@@ -81,7 +95,7 @@ def _shadowsocks_to_proxy(cfg: dict) -> dict:
 		"type": "ss",
 		"server": cfg["server"],
 		"port": int(cfg["server_port"]),
-		"cipher": cfg["method"],
+		"cipher": _normalize_ss_cipher(cfg["method"]),
 		"password": str(cfg["password"]),
 		"udp": True,
 	}
@@ -237,8 +251,19 @@ def _is_ipv4(host: str) -> bool:
 	return bool(re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", (host or "").strip()))
 
 
+def _dns_pre_resolve_proxy_server() -> bool:
+	"""默认关闭：由 Mihomo 内置 DoH 解析节点域名；Python 侧预解析易拿到污染/过期 IP 导致全节点 0 速。"""
+	try:
+		from config import config
+
+		cfg = config.get("dns") or {}
+		return bool(cfg.get("pre_resolve_proxy_server", False))
+	except Exception:
+		return False
+
+
 def _prefer_resolved_server(proxy: dict) -> None:
-	"""DoH/系统 DNS 预解析 server，避免 Mihomo 在污染 DNS 下连不上节点。"""
+	"""可选：DoH/系统 DNS 预解析 server（仅当 ssrspeed_config.json dns.pre_resolve_proxy_server=true）。"""
 	server = proxy.get("server")
 	if not isinstance(server, str) or not server.strip() or _is_ipv4(server):
 		return
@@ -281,7 +306,8 @@ def _sanitize_mihomo_proxy(proxy: dict) -> dict:
 
 def _finalize_mihomo_proxy(proxy: dict) -> dict:
 	out = _sanitize_mihomo_proxy(proxy)
-	_prefer_resolved_server(out)
+	if _dns_pre_resolve_proxy_server():
+		_prefer_resolved_server(out)
 	return out
 
 

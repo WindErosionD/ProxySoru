@@ -13,7 +13,11 @@
 		"enabled": true,
 		"subscription": true,
 		"inbound": true,
+		"pre_resolve_proxy_server": false,
+		"mihomo_builtin_dns": false,
+		"mihomo_dns_mode": "fake-ip",
 		"doh_timeout_seconds": 5,
+		"system_dns_timeout_seconds": 3,
 		"doh_parallel": true,
 		"providers": ["cloudflare", "google", "quad9"]
 	},
@@ -68,13 +72,22 @@
 		"aio_connect_timeout_seconds": 6,
 		"aio_read_timeout_seconds": 10,
 		"geo_parallel": true,
-		"speed_zero_retry": false,
+		"speed_zero_retry": true,
+		"st_zero_retry_quick": true,
+		"st_async_fast_fail": true,
+		"st_async_fast_fail_seconds": 2,
+		"st_zero_retry_connect_seconds": 4,
+		"st_zero_retry_read_seconds": 6,
 		"mihomo_api_host": "127.0.0.1",
 		"mihomo_api_port": 9190,
 		"mihomo_api_secret": "",
 		"mihomo_api_timeout": 5,
-		"mihomo_settle_seconds": 0.12,
-		"mihomo_hard_restart_every": 80
+		"mihomo_settle_seconds": 0.18,
+		"mihomo_hard_restart_every": 80,
+		"mihomo_hot_reload": true,
+		"mihomo_tunnel_check": false,
+		"mihomo_delay_timeout_ms": 3000,
+		"mihomo_delay_test_url": "http://www.gstatic.com/generate_204"
 	},
 	"exportResult": {
 		"hide_max_speed": false,
@@ -188,9 +201,14 @@
 		],
 		"downloadLinks": [
 			{
+				"link": "https://speed.cloudflare.com/__down?bytes=52428800",
+				"fileSize": 50,
+				"tag": "Default"
+			},
+			{
 				"link": "https://download.microsoft.com/download/7/A/8/7A84E002-6512-4506-A812-CA66FF6766D9/officeserversp2013-kb2880552-fullfile-x64-en-us.exe",
 				"fileSize": 1900,
-				"tag": "Default"
+				"tag": "DefaultFallback"
 			},
 			{
 				"link": "https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe",

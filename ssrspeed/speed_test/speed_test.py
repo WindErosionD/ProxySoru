@@ -99,9 +99,14 @@ class SpeedTest(object):
 		self.__service_workers = int(perf_cfg.get("service_workers", 8))
 		self.__client_poll = float(perf_cfg.get("client_ready_poll", 0.2))
 		self.__client_max_wait = float(perf_cfg.get("client_ready_max_wait", 2.5))
+		if perf_cfg.get("mihomo_tunnel_check"):
+			delay_wait = float(perf_cfg.get("mihomo_delay_timeout_ms", 3000)) / 1000.0 + 2.0
+			self.__client_max_wait = max(self.__client_max_wait, delay_wait)
+		self.__mihomo_tunnel_check = bool(perf_cfg.get("mihomo_tunnel_check", False))
 		self.__port_poll = float(perf_cfg.get("port_check_poll", 0.2))
 		self.__port_max_wait = float(perf_cfg.get("port_check_max_wait", 2.0))
 		self.__speed_zero_retry = bool(perf_cfg.get("speed_zero_retry", False))
+		self.__st_zero_retry_quick = bool(perf_cfg.get("st_zero_retry_quick", True))
 		self.__results = []
 		self.__current = {}
 		self.__baseResult = {
@@ -182,6 +187,16 @@ class SpeedTest(object):
 		time.sleep(min(0.15, self.__client_poll))
 		while time.time() < deadline:
 			if client.check_alive():
+				if self.__mihomo_tunnel_check and hasattr(client, "wait_proxy_ready"):
+					if client.wait_proxy_ready(cfg):
+						return True
+					logger.warning("Proxy tunnel not ready, retrying Mihomo for this node.")
+					try:
+						client.startClient(cfg)
+					except Exception:
+						logger.exception("Client restart after tunnel failure.")
+					time.sleep(self.__client_poll)
+					continue
 				return True
 			try:
 				client.startClient(cfg)
@@ -713,8 +728,20 @@ class SpeedTest(object):
 								logger.warning("startTest returned None; treating as zero speed.")
 								testRes = (0, 0, [], 0)
 							if self.__speed_zero_retry and int(testRes[0]) == 0:
-								logger.warning("Re-testing node.")
-								testRes = st.startTest(self.__testMethod) or (0, 0, [], 0)
+								logger.warning("Re-testing node after zero speed (hard restart Mihomo).")
+								if hasattr(client, "force_hard_restart"):
+									try:
+										client.force_hard_restart(cfg)
+										self.__wait_local_port()
+									except Exception:
+										logger.exception("Mihomo hard restart on zero-speed retry failed.")
+								testRes = (
+									st.startTest(
+										self.__testMethod,
+										st_quick=self.__st_zero_retry_quick,
+									)
+									or (0, 0, [], 0)
+								)
 							global ntype
 							global htype
 							global dtype

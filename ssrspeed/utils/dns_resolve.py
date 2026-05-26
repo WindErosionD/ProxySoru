@@ -12,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from typing import List, Optional, Tuple
 
 from config import config
@@ -200,11 +200,16 @@ def resolve_ipv4_with_fallback(hostname: str) -> str:
 		ip = resolve_ipv4_best(hostname.strip())
 		if ip:
 			return ip
+	sys_timeout = float(_dns_config().get("system_dns_timeout_seconds", 3))
 	try:
-		return socket.gethostbyname(hostname.strip())
+		with ThreadPoolExecutor(max_workers=1) as ex:
+			fut = ex.submit(socket.gethostbyname, hostname.strip())
+			return fut.result(timeout=max(0.5, sys_timeout))
+	except FuturesTimeout:
+		logger.warning("System DNS timeout for %s (%.1fs)", hostname, sys_timeout)
 	except OSError:
 		logger.warning("System DNS failed for %s", hostname)
-		return "N/A"
+	return "N/A"
 
 
 def subscription_resolve_entry(url: str) -> Optional[str]:

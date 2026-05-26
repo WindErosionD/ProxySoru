@@ -43,7 +43,7 @@ class SpeedTestMethods(object):
 	def __initSocket(self):
 		socket.socket = DEFAULT_SOCKET
 
-	def startTest(self,method = "ST_ASYNC"):
+	def startTest(self, method="ST_ASYNC", st_quick=False):
 		logger.info("Starting speed test with %s" % method)
 		if (method == "SPEED_TEST_NET"):
 			try:
@@ -100,7 +100,7 @@ class SpeedTestMethods(object):
 				return (0, 0, [], 0)
 		elif method == "ST_ASYNC":
 			try:
-				return st_asyncio.start(LOCAL_ADDRESS, LOCAL_PORT)
+				return st_asyncio.start(LOCAL_ADDRESS, LOCAL_PORT, quick=st_quick)
 			except:
 				logger.exception("")
 				return (0, 0, [], 0)
