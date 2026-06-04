@@ -127,6 +127,7 @@ def _fetch_geo_from_sources(ip=""):
 	}
 	sources = _geo_source_list(ip_path)
 	last_err = None
+	failed_sources = []
 
 	if _GEO_PARALLEL and len(sources) > 1:
 		with ThreadPoolExecutor(max_workers=min(6, len(sources))) as ex:
@@ -135,9 +136,15 @@ def _fetch_geo_from_sources(ip=""):
 				source_name, normalized, err = fut.result()
 				if err:
 					last_err = err
-					logger.warning("GeoIP source failed: %s (%s)", source_name, err.__class__.__name__)
+					failed_sources.append("{} ({})".format(source_name, err.__class__.__name__))
 					continue
 				if normalized:
+					if failed_sources:
+						logger.warning(
+							"GeoIP %d source(s) failed before success: %s",
+							len(failed_sources),
+							"; ".join(failed_sources),
+						)
 					logger.info("GeoIP source selected: %s", source_name)
 					if ip_path:
 						_GEO_CACHE[ip_path] = normalized
@@ -147,16 +154,26 @@ def _fetch_geo_from_sources(ip=""):
 			source_name, normalized, err = _fetch_geo_one_source(source, headers)
 			if err:
 				last_err = err
-				logger.warning("GeoIP source failed: %s (%s)", source_name, err.__class__.__name__)
+				failed_sources.append("{} ({})".format(source_name, err.__class__.__name__))
 				continue
 			if normalized:
+				if failed_sources:
+					logger.warning(
+						"GeoIP %d source(s) failed before success: %s",
+						len(failed_sources),
+						"; ".join(failed_sources),
+					)
 				logger.info("GeoIP source selected: %s", source_name)
 				if ip_path:
 					_GEO_CACHE[ip_path] = normalized
 				return normalized
 
-	if last_err:
-		logger.error("All GeoIP sources failed: %s", str(last_err))
+	if failed_sources:
+		logger.warning(
+			"GeoIP all %d source(s) failed: %s",
+			len(failed_sources),
+			"; ".join(failed_sources),
+		)
 	if ip_path:
 		_GEO_CACHE[ip_path] = {}
 	return {}

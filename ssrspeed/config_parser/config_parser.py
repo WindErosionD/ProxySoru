@@ -99,13 +99,30 @@ class UniversalParser:
 		if scheme in ("vless", "reality"):
 			cfg["uuid"] = parsed.username or ""
 			cfg["network"] = query.get("type", ["tcp"])[0]
-			security = "reality" if scheme == "reality" else query.get("security", ["none"])[0]
+			pbk = query.get("pbk", [""])[0]
+			security = (query.get("security", [""])[0] or "none").lower()
+			if scheme == "reality":
+				security = "reality"
+			elif pbk:
+				# 部分面板用 tls=1 + pbk/sid，不写 security=reality
+				security = "reality"
+			elif security in ("", "none"):
+				if self.__parse_bool(query.get("tls", ["0"])[0]):
+					security = "tls"
 			cfg["tls"] = security in ("tls", "reality")
-			cfg["servername"] = query.get("sni", query.get("host", [""]))[0]
-			cfg["skip-cert-verify"] = self.__parse_bool(query.get("allowInsecure", ["0"])[0])
+			cfg["servername"] = query.get("sni", query.get("host", query.get("peer", [""])))[0]
+			cfg["skip-cert-verify"] = self.__parse_bool(
+				query.get("allowInsecure", query.get("insecure", ["0"]))[0]
+			)
 			flow = query.get("flow", [""])[0]
+			if not flow:
+				xtls = query.get("xtls", [""])[0]
+				if xtls in ("1", "2"):
+					# 旧版分享链接用 xtls=2 表示 Vision（Reality 常见）
+					flow = "xtls-rprx-vision"
 			if flow:
 				cfg["flow"] = flow
+			cfg["udp"] = True
 			if cfg["network"] == "ws":
 				cfg["ws-opts"] = {
 					"path": query.get("path", ["/"])[0],
@@ -113,12 +130,10 @@ class UniversalParser:
 				}
 			if security == "reality":
 				cfg["reality-opts"] = {
-					"public-key": query.get("pbk", [""])[0],
+					"public-key": pbk,
 					"short-id": query.get("sid", [""])[0],
 				}
-				fingerprint = query.get("fp", [""])[0]
-				if fingerprint:
-					cfg["client-fingerprint"] = fingerprint
+				cfg["client-fingerprint"] = query.get("fp", [""])[0] or "chrome"
 				spider_x = query.get("spx", [""])[0]
 				if spider_x:
 					cfg["reality-opts"]["spider-x"] = spider_x

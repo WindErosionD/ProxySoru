@@ -757,16 +757,8 @@ def run_main(quiet=False, skip_start_banner=False):
 				return 0
 
 		test_name = input("请输入测速名称（选填，用于结果文件名）: ").strip()
-		while True:
-			topo_raw = input("是否开启拓扑测试？(y/n): ").strip()
-			if topo_raw == "":
-				enable_topology = False
-				break
-			topo = topo_raw.lower()
-			if topo in ("y", "n"):
-				enable_topology = (topo == "y")
-				break
-			print("输入无效，请输入 y 或 n。")
+		topo_raw = input("是否开启拓扑测试？(默认开启，输入 n 关闭): ").strip().lower()
+		enable_topology = topo_raw not in ("n",)
 
 		extra_args = ["-u", sub_url, "-y", "--skip-requirements-check", "-m", "stasync", "-M", "all"]
 		if test_name:

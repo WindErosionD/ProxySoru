@@ -135,7 +135,7 @@ def _trojan_json_to_proxy(cfg: dict) -> dict:
 	sni = str(ssl.get("sni") or "")
 	v = ssl.get("verify", "true")
 	if isinstance(v, bool):
-		skip_cert = bool(v)
+		skip_cert = not v
 	else:
 		skip_cert = str(v).lower() not in ("true", "1", "yes")
 	out = {

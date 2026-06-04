@@ -35,6 +35,53 @@ _ST_FAST_FAIL_SEC = float(_PERF.get("st_async_fast_fail_seconds", 2.0))
 _ST_ZERO_QUICK = bool(_PERF.get("st_zero_retry_quick", True))
 _ST_ZERO_CONNECT = float(_PERF.get("st_zero_retry_connect_seconds", 4))
 _ST_ZERO_READ = float(_PERF.get("st_zero_retry_read_seconds", 6))
+_WIN_MAX_WORKERS = int(_PERF.get("st_async_windows_max_workers", 8))
+_ST_MIN_VALID_BYTES = int(_PERF.get("st_async_min_valid_bytes", 64 * 1024))
+
+
+def _short_error(exc: BaseException) -> str:
+	text = str(exc).strip()
+	if not text:
+		return exc.__class__.__name__
+	if "Caused by" in text:
+		text = text.split("Caused by", 1)[-1].strip()
+	if len(text) > 160:
+		text = text[:157] + "..."
+	return text
+
+
+class _BatchLog:
+	"""合并同批次 worker 的重复日志。"""
+
+	def __init__(self):
+		self._lock = threading.Lock()
+		self._started = False
+		self._failures = {}
+
+	def start_once(self, url: str, host: str, port: int, backend: str, workers: int):
+		with self._lock:
+			if self._started:
+				return
+			self._started = True
+			logger.info(
+				"Fetching %s via %s:%s (%s), workers=%d.",
+				url, host, port, backend, workers,
+			)
+
+	def fail(self, backend: str, detail: str):
+		key = (backend, detail)
+		with self._lock:
+			self._failures[key] = self._failures.get(key, 0) + 1
+
+	def flush(self):
+		with self._lock:
+			items = list(self._failures.items())
+			self._failures.clear()
+		for (backend, detail), count in items:
+			logger.warning(
+				"ST_ASYNC %s failed x%d: %s",
+				backend, count, detail,
+			)
 
 
 def _client_timeout(quick: bool = False):
@@ -140,6 +187,10 @@ class Statistics:
 		print("\r[" + "=" * self._count + "> [{:.2f} MB/s]".format(speed_mb), end='')
 
 
+def _is_valid_result(sta) -> bool:
+	return sta is not None and sta.total_red >= _ST_MIN_VALID_BYTES
+
+
 async def _fetch(
 	url: str,
 	sta: Statistics,
@@ -147,6 +198,7 @@ async def _fetch(
 	port: int = 1087,
 	rdns: bool = True,
 	quick: bool = False,
+	batch_log: _BatchLog = None,
 ):
 	connector = SocksConnector(
 		socks_ver=SocksVer.SOCKS5,
@@ -154,7 +206,11 @@ async def _fetch(
 		port=port,
 		rdns=rdns,
 	)
-	logger.info("Fetching %s via %s:%s (aiohttp rdns=%s).", url, host, port, rdns)
+	backend = "aiohttp rdns={}".format(rdns)
+	if batch_log:
+		batch_log.start_once(url, host, port, backend, 1)
+	else:
+		logger.info("Fetching %s via %s:%s (%s).", url, host, port, backend)
 	try:
 		async with aiohttp.ClientSession(
 			connector=connector,
@@ -168,11 +224,17 @@ async def _fetch(
 						break
 					await sta.record(len(chunk))
 	except (ClientOSError, ClientConnectorError, SocksError, SocksConnectionError, asyncio.TimeoutError, ConnectionResetError, OSError) as e:
-		detail = str(e).strip() or e.__class__.__name__
-		logger.warning("aiohttp worker failed via %s:%s: %s", host, port, detail)
+		detail = _short_error(e)
+		if batch_log:
+			batch_log.fail(backend, detail)
+		else:
+			logger.warning("aiohttp worker failed via %s:%s: %s", host, port, detail)
 	except ClientError as e:
-		detail = str(e).strip() or e.__class__.__name__
-		logger.warning("aiohttp HTTP error via %s:%s: %s", host, port, detail)
+		detail = _short_error(e)
+		if batch_log:
+			batch_log.fail(backend, detail)
+		else:
+			logger.warning("aiohttp HTTP error via %s:%s: %s", host, port, detail)
 	except Exception:
 		logger.exception("aiohttp worker unexpected error via %s:%s", host, port)
 
@@ -187,8 +249,12 @@ def _requests_proxies(host: str, port: int, mode: str) -> dict:
 	return {"http": px, "https": px}
 
 
-def _requests_fetch(url: str, sta: Statistics, host: str, port: int, mode: str, quick: bool = False):
-	logger.info("Fetching %s via %s:%s (requests %s).", url, host, port, mode)
+def _requests_fetch(url: str, sta: Statistics, host: str, port: int, mode: str, quick: bool = False, batch_log: _BatchLog = None):
+	backend = "requests {}".format(mode)
+	if batch_log:
+		batch_log.start_once(url, host, port, backend, 1)
+	else:
+		logger.info("Fetching %s via %s:%s (%s).", url, host, port, backend)
 	proxies = _requests_proxies(host, port, mode)
 	timeout = _client_timeout(quick)
 	headers = {"User-Agent": "curl/11.45.14"}
@@ -207,8 +273,11 @@ def _requests_fetch(url: str, sta: Statistics, host: str, port: int, mode: str, 
 				if chunk:
 					sta.record_sync(len(chunk))
 	except requests.RequestException as e:
-		detail = str(e).strip() or e.__class__.__name__
-		logger.warning("requests worker failed via %s:%s (%s): %s", host, port, mode, detail)
+		detail = _short_error(e)
+		if batch_log:
+			batch_log.fail(backend, detail)
+		else:
+			logger.warning("requests worker failed via %s:%s (%s): %s", host, port, mode, detail)
 	except Exception:
 		logger.exception("requests worker unexpected error via %s:%s (%s)", host, port, mode)
 
@@ -224,13 +293,20 @@ def _run_aio_workers(
 	loop = asyncio.new_event_loop()
 	asyncio.set_event_loop(loop)
 	sta = Statistics()
+	batch_log = _BatchLog()
+	batch_log.start_once(
+		url, proxy_host, proxy_port, "aiohttp rdns={}".format(rdns), workers,
+	)
 	tasks = [
-		loop.create_task(_fetch(url, sta, proxy_host, proxy_port, rdns=rdns, quick=quick))
+		loop.create_task(
+			_fetch(url, sta, proxy_host, proxy_port, rdns=rdns, quick=quick, batch_log=batch_log)
+		)
 		for _ in range(workers)
 	]
 	try:
 		loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
 	finally:
+		batch_log.flush()
 		loop.close()
 	return sta
 
@@ -244,9 +320,13 @@ def _run_requests_workers(
 	quick: bool = False,
 ) -> Statistics:
 	sta = Statistics()
+	batch_log = _BatchLog()
+	batch_log.start_once(url, proxy_host, proxy_port, "requests {}".format(mode), workers)
 	with ThreadPoolExecutor(max_workers=workers) as exe:
 		futs = [
-			exe.submit(_requests_fetch, url, sta, proxy_host, proxy_port, mode, quick)
+			exe.submit(
+				_requests_fetch, url, sta, proxy_host, proxy_port, mode, quick, batch_log,
+			)
 			for _ in range(workers)
 		]
 		for fut in as_completed(futs):
@@ -254,10 +334,19 @@ def _run_requests_workers(
 				fut.result()
 			except Exception:
 				logger.exception("requests worker thread failed.")
+	batch_log.flush()
 	return sta
 
 
 def _result_tuple(sta: Statistics):
+	if not _is_valid_result(sta):
+		got = sta.total_red if sta else 0
+		if got > 0:
+			logger.warning(
+				"ST_ASYNC download too small (%d bytes, need >= %d); treating as failed.",
+				got, _ST_MIN_VALID_BYTES,
+			)
+		sta = Statistics()
 	sta.show_progress_full()
 	if sta.time_used:
 		return (sta.total_red / sta.time_used, sta.max_speed, sta.speed_list, sta.total_red)
@@ -276,9 +365,9 @@ def _try_request_modes(
 	for mode in modes:
 		t0 = time.time()
 		sta = _run_requests_workers(url, proxy_host, proxy_port, workers, mode, quick=quick)
-		if sta.total_red > 0:
+		if _is_valid_result(sta):
 			return sta
-		if fast_fail and (time.time() - t0) < _ST_FAST_FAIL_SEC:
+		if fast_fail and sta.total_red == 0 and (time.time() - t0) < _ST_FAST_FAIL_SEC:
 			logger.info(
 				"ST_ASYNC fast-fail after %s (%.2fs); proxy likely down.",
 				mode,
@@ -286,6 +375,51 @@ def _try_request_modes(
 			)
 			break
 	return None
+
+
+def _run_speed_test_for_url(
+	url: str,
+	proxy_host: str,
+	proxy_port: int,
+	workers: int,
+	quick: bool = False,
+) -> Statistics:
+	request_modes = ("socks5h",) if quick else ("socks5h", "http", "socks5")
+	fast_fail = _ST_FAST_FAIL and not quick
+
+	sta = _try_request_modes(
+		url, proxy_host, proxy_port, workers, request_modes, quick=quick, fast_fail=fast_fail,
+	)
+	if _is_valid_result(sta):
+		return sta
+
+	if quick:
+		return sta or Statistics()
+
+	# 先尝试多路并行 fallback，避免过早降为单连接（单 TCP 常封顶 ~20–30 MB/s）
+	if check_platform() == "Windows":
+		logger.warning("ST_ASYNC requests got insufficient data on Windows; trying aiohttp fallback.")
+
+	for rdns in (True, False):
+		sta = _run_aio_workers(url, proxy_host, proxy_port, workers, rdns=rdns, quick=False)
+		if _is_valid_result(sta):
+			return sta
+
+	for mode in ("socks5h", "http", "socks5"):
+		logger.warning("ST_ASYNC aiohttp got insufficient data; retry with requests (%s).", mode)
+		sta = _run_requests_workers(url, proxy_host, proxy_port, workers, mode, quick=False)
+		if _is_valid_result(sta):
+			return sta
+
+	# 最后手段：多路并行 HTTPS 流常被中途 RST 时，单连接更稳但带宽上限更低
+	if workers > 1:
+		logger.info("ST_ASYNC retry with 1 worker (last resort; may cap below multi-stream peak).")
+		for mode in ("socks5h", "http", "socks5"):
+			sta = _run_requests_workers(url, proxy_host, proxy_port, 1, mode, quick=False)
+			if _is_valid_result(sta):
+				return sta
+
+	return Statistics()
 
 
 def start(
@@ -301,34 +435,27 @@ def start(
 	file_size = res[1]
 	logger.debug("Url: %s, file_size: %s MiB", url, file_size)
 	if check_platform() == "Windows":
-		workers = min(workers, 4)
+		workers = min(workers, _WIN_MAX_WORKERS)
 	logger.info("Running st_async, workers: %s%s", workers, " (quick retry)" if quick else "")
 
-	request_modes = ("socks5h",) if quick else ("socks5h", "http", "socks5")
-	fast_fail = _ST_FAST_FAIL and not quick
+	primary = (url, file_size)
+	candidates = [primary]
+	if not quick:
+		candidates.extend(dlrm.get_fallback_links(primary))
 
-	sta = _try_request_modes(
-		url, proxy_host, proxy_port, workers, request_modes, quick=quick, fast_fail=fast_fail,
-	)
-	if sta is not None and sta.total_red > 0:
-		return _result_tuple(sta)
-
-	if quick:
-		return _result_tuple(Statistics())
-
-	# Windows 上 aiohttp-socks + HTTPS 常失败；优先 requests（与 Clash 系客户端一致）
-	if check_platform() == "Windows":
-		logger.warning("ST_ASYNC requests got 0 bytes on Windows; trying aiohttp fallback.")
-
-	for rdns in (True, False):
-		sta = _run_aio_workers(url, proxy_host, proxy_port, workers, rdns=rdns, quick=False)
-		if sta.total_red > 0:
+	sta = None
+	for idx, (test_url, test_size) in enumerate(candidates):
+		if idx > 0:
+			logger.warning(
+				"ST_ASYNC primary URL failed; trying fallback #%d (%s, %s MiB).",
+				idx,
+				test_url,
+				test_size,
+			)
+		sta = _run_speed_test_for_url(
+			test_url, proxy_host, proxy_port, workers, quick=quick,
+		)
+		if _is_valid_result(sta):
 			return _result_tuple(sta)
 
-	for mode in ("socks5h", "http", "socks5"):
-		logger.warning("ST_ASYNC aiohttp got 0 bytes; retry with requests (%s).", mode)
-		sta = _run_requests_workers(url, proxy_host, proxy_port, workers, mode, quick=False)
-		if sta.total_red > 0:
-			return _result_tuple(sta)
-
-	return _result_tuple(Statistics())
+	return _result_tuple(sta or Statistics())

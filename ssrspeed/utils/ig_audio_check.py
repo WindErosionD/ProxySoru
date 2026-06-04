@@ -1,19 +1,16 @@
 # coding: utf-8
 """
-检测「Instagram 带版权音乐 / 授权音频」是否可用（与仅打开 instagram.com 不同）。
+IG 音频解锁：模拟用户打开帖子页，再对 CDN 媒体流做 Range 抽样，确认是否含可播音轨。
 
-经 SOCKS 访问官网取 csrftoken，再请求 GraphQL 取 Reels 元数据中的
-clips_music_attribution_info（uses_original_audio=false 的授权曲库音乐）。
-仅当授权音乐 should_mute_audio=false 且可验证到音视频流时判为可用；
-原创音频（uses_original_audio=true）不参与判定，避免误报。
-
-返回 True=可播授权音乐, False=应静音/地区无授权, None=无法完成检测。
+返回 True=可播, False=不可播/应静音, None=无法完成检测。
 """
 
+import html as html_lib
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
+from xml.etree import ElementTree
 
 logger = logging.getLogger("Sub")
 
@@ -31,32 +28,25 @@ try:
 except Exception:
 	_app_config = {}
 
-GRAPHQL_POST = "https://www.instagram.com/api/graphql"
-GRAPHQL_GET = "https://www.instagram.com/graphql/query/"
 ORIGIN = "https://www.instagram.com"
-
-# 授权曲库音乐 Reels（uses_original_audio=false）；勿用原创音频帖（易误报可用）
-_DEFAULT_PROBE_SHORTCODES = (
-	"DCchrGBJFYA",  # Starbucks 2024 holiday / Sam & Dave 授权曲
-	"DIJfw-Iu6h4",  # 社区常用 Taylor Swift / Fortnight 相关 Reel
-	"ConUVfbgKEl",  # Miley Cyrus - Flowers 授权 Reel
-	"DVn-vNTCIfX",  # 带背景音乐的 Reel（yt-dlp 社区样例）
-	"DI-stckPoqZ",  # 授权音乐 Reel
-)
-
+GRAPHQL_GET = "https://www.instagram.com/graphql/query/"
 DOC_ID_SHORTCODE_MEDIA = "8845758582119845"
-DOC_ID_POST_ROOT = "26544629655158927"
-DOC_ID_POST_ACTION_LEGACY = "10015901848480474"
 
-_VARS_LEGACY = (
-	'{"shortcode":"%s","fetch_comment_count":40,'
-	'"fetch_related_profile_media_count":3,"parent_comment_count":24,'
-	'"child_comment_count":3,"fetch_like_count":10,"fetch_tagged_user_count":null,'
-	'"fetch_preview_comment_count":2,"has_threaded_comments":true,'
-	'"hoisted_comment_id":null,"hoisted_reply_id":null}'
-)
+_DEFAULT_PROBE_SHORTCODES = ("DHuyNBZSV_1",)
 
-_MIN_LICENSED_UNMUTE = 1
+# Range 抽样上限；足够判断 mp4 是否含音轨，又避免拖慢测速
+_RANGE_BYTES = 65536
+_MIN_RANGE_GOT = 8192
+_MAX_CDN_PROBES = 2
+
+
+def _perf_timeout(default: float) -> float:
+	perf = _app_config.get("performance") or {}
+	try:
+		v = float(perf.get("ig_audio_timeout_seconds", default))
+	except (TypeError, ValueError):
+		v = default
+	return max(4.0, min(v, 12.0))
 
 
 def _probe_shortcodes() -> Tuple[str, ...]:
@@ -73,6 +63,67 @@ def _proxies(local_port: int):
 	return {"http": p, "https": p}
 
 
+def _session():
+	if _CFFI:
+		for imp in ("chrome131", "chrome124", "chrome120", "chrome110"):
+			try:
+				return _http.Session(impersonate=imp)
+			except Exception:
+				continue
+	return _http.Session()
+
+
+def _nav_headers(referer: str = ORIGIN + "/") -> dict:
+	return {
+		"User-Agent": (
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+			"(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+		),
+		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+		"Accept-Language": "en-US,en;q=0.9",
+		"Accept-Encoding": "gzip, deflate, br",
+		"Referer": referer,
+		"Sec-Fetch-Site": "same-origin",
+		"Sec-Fetch-Mode": "navigate",
+		"Sec-Fetch-Dest": "document",
+		"Sec-Fetch-User": "?1",
+		"Upgrade-Insecure-Requests": "1",
+	}
+
+
+def _api_headers(referer: str, csrf: str) -> dict:
+	return {
+		"User-Agent": (
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+			"(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+		),
+		"Accept": "*/*",
+		"Accept-Language": "en-US,en;q=0.9",
+		"Referer": referer,
+		"X-IG-App-ID": "936619743392459",
+		"X-ASBD-ID": "129477",
+		"X-CSRFToken": csrf,
+		"X-Requested-With": "XMLHttpRequest",
+		"Sec-Fetch-Site": "same-origin",
+		"Sec-Fetch-Mode": "cors",
+		"Sec-Fetch-Dest": "empty",
+	}
+
+
+def _cdn_headers(referer: str) -> dict:
+	return {
+		"User-Agent": (
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+			"(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+		),
+		"Accept": "*/*",
+		"Accept-Language": "en-US,en;q=0.9",
+		"Referer": referer,
+		"Origin": ORIGIN,
+		"Range": "bytes=0-{}".format(_RANGE_BYTES - 1),
+	}
+
+
 def _decode_graphql_body(text: str) -> Optional[dict]:
 	if not text or not text.strip():
 		return None
@@ -87,335 +138,289 @@ def _decode_graphql_body(text: str) -> Optional[dict]:
 		return None
 
 
-def _media_node(payload: dict) -> Optional[dict]:
-	if not isinstance(payload, dict):
-		return None
-	root = payload.get("data")
-	if not isinstance(root, dict):
-		return None
-	media = root.get("xdt_shortcode_media") or root.get("shortcode_media")
-	return media if isinstance(media, dict) else None
-
-
-def _music_attribution(media: dict) -> Optional[dict]:
-	mai = media.get("clips_music_attribution_info")
-	return mai if isinstance(mai, dict) else None
-
-
-def _licensed_mute_signal(media: dict) -> Optional[bool]:
-	"""
-	仅解析授权曲库音乐（uses_original_audio=false）的 should_mute_audio。
-	原创音频、无 music 字段的帖子返回 None（不参与判定）。
-	"""
-	mai = _music_attribution(media)
-	if not mai or mai.get("uses_original_audio") is not False:
-		return None
-	mute = mai.get("should_mute_audio")
-	if isinstance(mute, bool):
-		return mute
-	return None
-
-
-def _licensed_mute_from_payload(payload: dict) -> Optional[bool]:
-	media = _media_node(payload)
-	if not media:
-		return None
-	return _licensed_mute_signal(media)
-
-
-def _licensed_mute_from_text_regex(text: str) -> Optional[bool]:
-	"""
-	仅在 clips_music_attribution_info 且 uses_original_audio:false 的片段内匹配 mute。
-	避免误读 sidecar / 原创音频字段。
-	"""
-	if not text:
-		return None
-	for chunk in re.findall(
-		r'"clips_music_attribution_info"\s*:\s*(\{.*?\})(?=,\s*"[A-Za-z_]+"\s*:|\})',
-		text,
+def _json_blobs_from_html(page_html: str) -> List[dict]:
+	blobs: List[dict] = []
+	if not page_html:
+		return blobs
+	for m in re.finditer(
+		r'<script type="application/json"[^>]*>(\{.*?\})</script>',
+		page_html,
 		re.S,
 	):
-		if re.search(r'"uses_original_audio"\s*:\s*true', chunk, re.I):
+		try:
+			blobs.append(json.loads(m.group(1)))
+		except Exception:
 			continue
-		if not re.search(r'"uses_original_audio"\s*:\s*false', chunk, re.I):
-			continue
-		m = re.search(r'"should_mute_audio"\s*:\s*(true|false)', chunk, re.I)
-		if m:
-			return m.group(1).lower() == "true"
+	return blobs
+
+
+def _find_media_node(obj: Any) -> Optional[dict]:
+	if isinstance(obj, dict):
+		typ = obj.get("__typename") or ""
+		if typ.endswith("Media") or typ in ("GraphVideo", "GraphSidecar", "XDTGraphVideo", "XDTGraphSidecar"):
+			if obj.get("shortcode") or obj.get("video_url") or obj.get("video_dash_manifest"):
+				return obj
+		for key in ("xdt_shortcode_media", "shortcode_media", "media"):
+			val = obj.get(key)
+			if isinstance(val, dict):
+				return val
+		for val in obj.values():
+			found = _find_media_node(val)
+			if found is not None:
+				return found
+	elif isinstance(obj, list):
+		for item in obj:
+			found = _find_media_node(item)
+			if found is not None:
+				return found
 	return None
 
 
-def _session():
-	if _CFFI:
-		for imp in ("chrome131", "chrome124", "chrome120", "chrome110"):
-			try:
-				return _http.Session(impersonate=imp)
-			except Exception:
-				continue
-	return _http.Session()
+def _media_from_html(page_html: str) -> Optional[dict]:
+	for blob in _json_blobs_from_html(page_html):
+		media = _find_media_node(blob)
+		if media is not None:
+			return media
+	return None
 
 
-def _graphql_get_shortcode_media(sess, proxies: dict, headers: dict, shortcode: str, timeout: float) -> Optional[dict]:
-	variables = {
-		"shortcode": shortcode,
-		"child_comment_count": 3,
-		"fetch_comment_count": 40,
-		"parent_comment_count": 24,
-		"has_threaded_comments": True,
-	}
+def _graphql_media(sess, proxies: dict, headers: dict, shortcode: str, timeout: float) -> Optional[dict]:
 	params = {
 		"doc_id": DOC_ID_SHORTCODE_MEDIA,
-		"variables": json.dumps(variables, separators=(",", ":")),
+		"variables": json.dumps(
+			{
+				"shortcode": shortcode,
+				"child_comment_count": 3,
+				"fetch_comment_count": 40,
+				"parent_comment_count": 24,
+				"has_threaded_comments": True,
+			},
+			separators=(",", ":"),
+		),
 	}
 	try:
-		r = sess.get(
-			GRAPHQL_GET,
-			params=params,
-			headers=headers,
-			proxies=proxies,
-			timeout=timeout,
-		)
+		r = sess.get(GRAPHQL_GET, params=params, headers=headers, proxies=proxies, timeout=timeout)
 	except Exception as exc:
-		logger.debug("IG audio probe: GET graphql/query %s: %s", shortcode, exc)
+		logger.debug("IG audio: graphql %s failed: %s", shortcode, exc)
 		return None
-	return _decode_graphql_body(r.text or "")
+	payload = _decode_graphql_body(r.text or "")
+	if not payload:
+		return None
+	root = payload.get("data") or {}
+	return root.get("xdt_shortcode_media") or root.get("shortcode_media")
 
 
-def _graphql_post_api(
-	sess,
-	proxies: dict,
-	headers: dict,
-	shortcode: str,
-	timeout: float,
-	*,
-	doc_id: str,
-	friendly_name: str,
-	variables_obj: dict,
-	legacy_string: Optional[str] = None,
-) -> Optional[dict]:
-	if legacy_string is not None:
-		variables_str = legacy_string % (shortcode,)
-	else:
-		variables_str = json.dumps(variables_obj, separators=(",", ":"))
-	form = {
-		"variables": variables_str,
-		"doc_id": doc_id,
-		"fb_api_req_friendly_name": friendly_name,
-		"fb_api_caller_class": "RelayModern",
-	}
+def _audio_urls_from_dash(manifest: str) -> List[str]:
+	if not manifest or not isinstance(manifest, str):
+		return []
+	urls: List[str] = []
+	text = manifest.strip()
+	if not text.startswith("<"):
+		return urls
 	try:
-		r = sess.post(
-			GRAPHQL_POST,
-			data=form,
-			headers=headers,
-			proxies=proxies,
-			timeout=timeout,
-		)
-	except Exception as exc:
-		logger.debug(
-			"IG audio probe: POST api/graphql %s %s: %s",
-			friendly_name,
-			shortcode,
-			exc,
-		)
-		return None
-	return _decode_graphql_body(r.text or "")
+		root = ElementTree.fromstring(text)
+	except ElementTree.ParseError:
+		return urls
+	ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
+	for adp in root.findall(".//mpd:AdaptationSet", ns) or root.findall(".//AdaptationSet"):
+		mime = (adp.get("mimeType") or adp.get("contentType") or "").lower()
+		codecs = (adp.get("codecs") or "").lower()
+		if "audio" not in mime and "mp4a" not in codecs and "audio" not in codecs:
+			continue
+		for tag in ("BaseURL", "mpd:BaseURL"):
+			for el in adp.findall(".//{}".format(tag)) or adp.findall(tag):
+				if el is not None and el.text:
+					u = html_lib.unescape(el.text.strip())
+					if u.startswith("http"):
+						urls.append(u)
+	return urls
 
 
-def _verify_playable_media(sess, proxies: dict, headers: dict, media: dict, timeout: float) -> bool:
-	"""授权音乐未标记 mute 时，尽量确认视频流/音频轨可访问。"""
-	if media.get("has_audio") is False:
-		return False
-	video_url = media.get("video_url")
-	if isinstance(video_url, str) and video_url.startswith("http"):
-		try:
-			r = sess.head(
-				video_url,
-				headers={**headers, "Referer": ORIGIN + "/"},
-				proxies=proxies,
-				timeout=min(timeout, 8.0),
-				allow_redirects=True,
-			)
-			if r.status_code < 400:
-				return True
-		except Exception as exc:
-			logger.debug("IG audio probe: video HEAD failed: %s", exc)
-	dash = media.get("dash_info") or media.get("video_dash_manifest")
-	if isinstance(dash, str) and ("audio" in dash.lower() or "mp4a" in dash.lower()):
-		return True
-	return media.get("has_audio") is True
+def _collect_stream_urls(media: dict) -> List[str]:
+	if not isinstance(media, dict):
+		return []
+	seen = set()
+	out: List[str] = []
 
+	def add(u):
+		if isinstance(u, str) and u.startswith("http") and u not in seen:
+			seen.add(u)
+			out.append(u)
 
-def _evaluate_licensed_media(media: dict) -> Optional[bool]:
-	mute = _licensed_mute_signal(media)
-	if mute is True:
-		mai = _music_attribution(media) or {}
-		logger.debug(
-			"IG audio probe: licensed mute=true song=%r artist=%r reason=%r",
-			mai.get("song_name"),
-			mai.get("artist_name"),
-			(mai.get("should_mute_audio_reason") or "")[:120],
-		)
-		return False
-	if mute is False:
-		return True
-	return None
-
-
-def _payload_paths_for_shortcode(
-	sess,
-	proxies: dict,
-	base_headers: dict,
-	csrf: str,
-	shortcode: str,
-	timeout: float,
-) -> List[dict]:
-	get_headers = {
-		**base_headers,
-		"X-CSRFToken": csrf,
-		"X-Requested-With": "XMLHttpRequest",
-		"Referer": "{}/reel/{}/".format(ORIGIN, shortcode),
-	}
-	post_headers = {
-		**get_headers,
-		"Content-Type": "application/x-www-form-urlencoded",
-		"Origin": ORIGIN,
-	}
-	vars_post_root = {
-		"shortcode": shortcode,
-		"child_comment_count": 3,
-		"fetch_comment_count": 40,
-		"parent_comment_count": 24,
-		"has_threaded_comments": True,
-	}
-	out: List[dict] = []
-
-	payload = _graphql_get_shortcode_media(sess, proxies, get_headers, shortcode, timeout)
-	if payload is not None:
-		out.append(payload)
-
-	payload = _graphql_post_api(
-		sess,
-		proxies,
-		post_headers,
-		shortcode,
-		timeout,
-		doc_id=DOC_ID_POST_ROOT,
-		friendly_name="PolarisPostRootQuery",
-		variables_obj=vars_post_root,
-	)
-	if payload is not None:
-		out.append(payload)
-
-	payload = _graphql_post_api(
-		sess,
-		proxies,
-		post_headers,
-		shortcode,
-		timeout,
-		doc_id=DOC_ID_POST_ACTION_LEGACY,
-		friendly_name="PolarisPostActionLoadPostQueryQuery",
-		variables_obj={},
-		legacy_string=_VARS_LEGACY,
-	)
-	if payload is not None:
-		out.append(payload)
+	add(media.get("video_url"))
+	for key in ("video_dash_manifest", "dash_info"):
+		val = media.get(key)
+		if isinstance(val, str):
+			for u in _audio_urls_from_dash(val):
+				add(u)
+		elif isinstance(val, dict):
+			for u in _audio_urls_from_dash(str(val.get("manifest") or val.get("video_dash_manifest") or "")):
+				add(u)
+	mai = media.get("clips_music_attribution_info")
+	if isinstance(mai, dict):
+		add(mai.get("audio_asset_id"))  # rarely a URL; harmless if not http
+	edges = (media.get("edge_sidecar_to_children") or {}).get("edges") or []
+	for edge in edges:
+		node = edge.get("node") if isinstance(edge, dict) else None
+		if isinstance(node, dict):
+			for u in _collect_stream_urls(node):
+				add(u)
 	return out
+
+
+def _chunk_has_audio_track(data: bytes) -> bool:
+	if len(data) < 256:
+		return False
+	if b"mp4a" in data or b"soun" in data or b".mp4a" in data:
+		return True
+	ct_audio = (b"audio/mp4", b"audio/mp4a", b"M4A ")
+	return any(sig in data[:4096] for sig in ct_audio)
+
+
+def _probe_cdn_stream(sess, url: str, proxies: dict, headers: dict, timeout: float) -> Optional[bool]:
+	"""Range 拉流抽样：True=检测到音轨, False=流不可用或无声, None=网络/超时。"""
+	try:
+		r = sess.get(url, headers=headers, proxies=proxies, timeout=timeout, stream=True)
+	except Exception as exc:
+		logger.debug("IG audio: CDN GET failed: %s", exc)
+		return None
+	try:
+		if r.status_code not in (200, 206):
+			logger.debug("IG audio: CDN status %s for %s", r.status_code, url[:80])
+			return False
+		buf = bytearray()
+		for chunk in r.iter_content(chunk_size=16384):
+			if not chunk:
+				break
+			buf.extend(chunk)
+			if len(buf) >= _RANGE_BYTES:
+				break
+		if len(buf) < _MIN_RANGE_GOT:
+			return False
+		return _chunk_has_audio_track(bytes(buf))
+	finally:
+		r.close()
+
+
+def _explicit_muted_in_media(media: dict) -> bool:
+	if not isinstance(media, dict):
+		return False
+	if media.get("has_audio") is False:
+		return True
+	mai = media.get("clips_music_attribution_info")
+	if isinstance(mai, dict) and mai.get("should_mute_audio") is True:
+		return True
+	return False
+
+
+def _bootstrap_csrf(sess, proxies: dict, timeout: float) -> Tuple[str, dict]:
+	try:
+		r = sess.get(ORIGIN + "/", headers=_nav_headers(), proxies=proxies, timeout=timeout)
+	except Exception as exc:
+		logger.debug("IG audio: GET / failed: %s", exc)
+		return "", {}
+	if r.status_code != 200:
+		return "", {}
+	page = r.text or ""
+	csrf = sess.cookies.get("csrftoken") or ""
+	if not csrf:
+		m = re.search(r'"csrfToken":"([^"]+)"', page) or re.search(r'"csrf_token":"([^"]+)"', page)
+		if m:
+			csrf = m.group(1)
+	extra = {}
+	lsd_m = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', page)
+	if lsd_m:
+		extra["X-FB-LSD"] = lsd_m.group(1)
+	return csrf, extra
 
 
 def _probe_one_shortcode(
 	sess,
 	proxies: dict,
-	base_headers: dict,
 	csrf: str,
+	extra_headers: dict,
 	shortcode: str,
-	timeout: float,
-) -> Tuple[Optional[bool], Optional[dict]]:
-	for payload in _payload_paths_for_shortcode(sess, proxies, base_headers, csrf, shortcode, timeout):
-		media = _media_node(payload)
-		if media is not None:
-			result = _evaluate_licensed_media(media)
-			if result is not None:
-				return result, media
-		mute = _licensed_mute_from_payload(payload)
-		if mute is None:
-			raw = json.dumps(payload) if isinstance(payload, dict) else ""
-			mute = _licensed_mute_from_text_regex(raw)
-		if mute is True:
-			return False, media
-		if mute is False and media is not None:
-			return True, media
-	return None, None
+	req_timeout: float,
+) -> Optional[bool]:
+	post_url = "{}/p/{}/".format(ORIGIN, shortcode)
+	page_html = ""
+	try:
+		r = sess.get(
+			post_url,
+			headers=_nav_headers(referer=ORIGIN + "/"),
+			proxies=proxies,
+			timeout=req_timeout,
+		)
+		if r.status_code == 200:
+			page_html = r.text or ""
+	except Exception as exc:
+		logger.debug("IG audio: GET %s failed: %s", post_url, exc)
+
+	media = _media_from_html(page_html)
+	api_h = _api_headers(post_url, csrf)
+	api_h.update(extra_headers)
+
+	if media is None:
+		media = _graphql_media(sess, proxies, api_h, shortcode, req_timeout)
+
+	if media is None:
+		logger.debug("IG audio: no media for shortcode %s", shortcode)
+		return None
+
+	stream_urls = _collect_stream_urls(media)
+	if not stream_urls:
+		if _explicit_muted_in_media(media):
+			return False
+		logger.debug("IG audio: %s has no stream URL", shortcode)
+		return None
+
+	cdn_h = _cdn_headers(post_url)
+	any_network_ok = False
+	for url in stream_urls[:_MAX_CDN_PROBES]:
+		result = _probe_cdn_stream(sess, url, proxies, cdn_h, req_timeout)
+		if result is None:
+			continue
+		any_network_ok = True
+		if result is True:
+			logger.debug("IG audio: %s playable (CDN audio track detected)", shortcode)
+			return True
+		logger.debug("IG audio: %s stream ok but no audio track in sample", shortcode)
+
+	if any_network_ok:
+		return False
+	if _explicit_muted_in_media(media):
+		return False
+	return None
 
 
 def probe_instagram_licensed_audio(local_port: int, timeout: float = 12.0) -> Optional[bool]:
 	"""
-	经本地 SOCKS(local_port) 探测：当前出口是否允许播放带 IG 授权曲库音乐的 Reels 音频。
-	返回 True=可用, False=不可用(已测得应静音/地区限制等), None=无法完成检测。
+	模拟用户：打开 IG 首页 → 打开探针帖子 → Range 抽样 CDN 媒体流是否含音轨。
+	仅检测第一个 shortcode，控制总耗时。
 	"""
+	total_budget = _perf_timeout(timeout)
+	req_timeout = max(3.0, min(total_budget * 0.42, 6.0))
+
 	sess = _session()
 	proxies = _proxies(local_port)
-	headers0 = {
-		"User-Agent": (
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-			"(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-		),
-		"Accept": "*/*",
-		"Accept-Language": "en-US,en;q=0.9",
-		"X-IG-App-ID": "936619743392459",
-		"X-ASBD-ID": "129477",
-		"Sec-Fetch-Site": "same-origin",
-		"Sec-Fetch-Mode": "cors",
-		"Sec-Fetch-Dest": "empty",
-	}
-	try:
-		r0 = sess.get(ORIGIN + "/", headers=headers0, proxies=proxies, timeout=timeout)
-	except Exception as exc:
-		logger.debug("IG audio probe: GET / failed: %s", exc)
-		return None
-	if r0.status_code != 200:
-		logger.debug("IG audio probe: GET / status %s", r0.status_code)
-		return None
-	html = r0.text or ""
-	csrf = sess.cookies.get("csrftoken") or ""
+
+	csrf, extra = _bootstrap_csrf(sess, proxies, req_timeout)
 	if not csrf:
-		m = re.search(r'"csrfToken":"([^"]+)"', html) or re.search(r'"csrf_token":"([^"]+)"', html)
-		if m:
-			csrf = m.group(1)
-	if not csrf:
-		logger.debug("IG audio probe: csrftoken not found")
+		logger.debug("IG audio: csrftoken missing")
 		return None
-	lsd_m = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', html)
-	if lsd_m:
-		headers0 = {**headers0, "X-FB-LSD": lsd_m.group(1)}
 
-	licensed_hits = 0
-	verified_media: Optional[dict] = None
+	shortcodes = _probe_shortcodes()
+	if not shortcodes:
+		return None
 
-	for sc in _probe_shortcodes():
-		result, media = _probe_one_shortcode(sess, proxies, headers0, csrf, sc, timeout)
-		if result is False:
-			logger.debug("IG audio probe: %s licensed should_mute_audio=true", sc)
-			return False
-		if result is True:
-			licensed_hits += 1
-			if verified_media is None and media is not None:
-				verified_media = media
-			logger.debug("IG audio probe: %s licensed should_mute_audio=false", sc)
-			if licensed_hits >= _MIN_LICENSED_UNMUTE:
-				break
-
-	if licensed_hits >= _MIN_LICENSED_UNMUTE:
-		if verified_media is not None and not _verify_playable_media(
-			sess, proxies, headers0, verified_media, timeout
-		):
-			logger.debug("IG audio probe: licensed unmuted but media stream check failed")
-			return False
-		return True
+	result = _probe_one_shortcode(
+		sess, proxies, csrf, extra, shortcodes[0], req_timeout,
+	)
+	if result is not None:
+		return result
 
 	logger.warning(
-		"IG audio probe: no licensed-music probe returned should_mute_audio "
-		"(posts removed, API changed, or only original-audio reels matched). "
-		"Update ig_audio_probe_shortcodes in ssrspeed_config.json if needed."
+		"IG audio probe inconclusive (shortcode=%s); check ig_audio_probe_shortcodes or network.",
+		shortcodes[0],
 	)
 	return None

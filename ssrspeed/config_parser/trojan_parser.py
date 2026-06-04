@@ -89,22 +89,28 @@ class TrojanParser(BaseParser):
 		result["password"][0] = password
 
 		if "?" in link:
-			host,link = link.split("?")
-		result["server"], result["server_port"] = host.split(":")
-		result["server_port"] = int(re.match(r"^\d+", result["server_port"]).group(0))
+			host, link = link.split("?", 1)
+		else:
+			host = link
+			link = ""
+		result["server"], port_part = host.rsplit(":", 1)
+		result["server_port"] = int(re.match(r"^\d+", port_part).group(0))
 
 		result["remote_addr"] = result["server"]
 		result["remote_port"] = result["server_port"]
 
 		if link:
-			link_args = dict(parse_qsl(link))
-			result["ssl"]["verify"] = link_args.get("allowinsecure", "") == "1"
-			logger.info(link_args.get("allowinsecure", ""))
-			result["ssl"]["sni"] = link_args.get("sni", "")
+			link_args = {k.lower(): v for k, v in parse_qsl(link)}
+			allow_insecure = link_args.get("allowinsecure", "0").lower() in ("1", "true", "yes")
+			# ssl.verify=true 表示校验证书；allowInsecure=1 时不校验
+			result["ssl"]["verify"] = "false" if allow_insecure else "true"
+			sni = link_args.get("sni") or link_args.get("peer") or ""
+			result["ssl"]["sni"] = sni
 			result["tcp"]["fast_open"] = link_args.get("tfo", "") == "1"
-			result["group"] = link_args.get("peer", "N/A")
-			#ws 协议 必传host 与 path
-			if "type" in link_args and link_args["type"] == "ws" and "host" in link_args and "path" in link_args:
+			if link_args.get("peer") and link_args.get("peer") != "N/A":
+				result["group"] = link_args.get("peer")
+			# ws 协议 必传 host 与 path
+			if link_args.get("type") == "ws" and link_args.get("host") and link_args.get("path"):
 				result["websocket"]["enabled"] = "true"
 				result["websocket"]["path"] = link_args["path"]
 				result["websocket"]["host"] = link_args["host"]

@@ -2,30 +2,76 @@
 
 from copy import deepcopy
 import logging
+import re
 
 from config import config
 
 logger = logging.getLogger("Sub")
+
+# Cloudflare __down 超过约 100MB 会返回 HTTP 403（2026 年起常见）
+_CF_DOWN_RE = re.compile(
+	r"^(https://speed\.cloudflare\.com/__down\?bytes=)(\d+)(.*)$",
+	re.I,
+)
+_CF_MAX_BYTES = 52_428_800  # 50 MiB
+
+
+def normalize_download_url(link: str) -> str:
+	"""将 Cloudflare 测速 URL 的 bytes 参数限制在可用上限内。"""
+	link = (link or "").strip()
+	m = _CF_DOWN_RE.match(link)
+	if not m:
+		return link
+	n = int(m.group(2))
+	if n <= _CF_MAX_BYTES:
+		return link
+	logger.info(
+		"Cloudflare speed URL bytes=%d exceeds limit (%d); using %d.",
+		n,
+		_CF_MAX_BYTES,
+		_CF_MAX_BYTES,
+	)
+	return "{}{}{}".format(m.group(1), _CF_MAX_BYTES, m.group(3))
+
 
 class DownloadRuleMatch:
 	def __init__(self):
 		self._config = deepcopy(config["fileDownload"])
 		self._download_links = deepcopy(self._config["downloadLinks"])
 	
-	def _get_download_link(self, tag: str = "") -> str:
+	def _link_pair(self, entry: dict) -> tuple:
+		return (
+			normalize_download_url(entry["link"]),
+			entry["fileSize"],
+		)
+
+	def _get_download_link(self, tag: str = "") -> tuple:
 		default = tuple()
 		for link in self._download_links:
 			if link["tag"] == "Default":
-				default = (link["link"], link["fileSize"])
+				default = self._link_pair(link)
 		if not tag:
 			logger.info("No tag, using default.")
 			return default
 		for link in self._download_links:
-			if(link["tag"] == tag):
+			if link["tag"] == tag:
 				logger.info(f"Tag matched: {tag}")
-				return (link["link"],link["fileSize"])
+				return self._link_pair(link)
 		logger.info(f"Tag {tag} not matched,using default.")
 		return default
+
+	def get_fallback_links(self, primary: tuple = None) -> list:
+		"""除主链接外，按配置顺序返回备用测速 URL（已 normalize）。"""
+		seen = set()
+		out = []
+		if primary:
+			seen.add(primary[0])
+		for entry in self._download_links:
+			pair = self._link_pair(entry)
+			if pair[0] not in seen:
+				seen.add(pair[0])
+				out.append(pair)
+		return out
 	
 	def _check_rule(self, data: dict):
 		isp = str(data.get("organization", "N/A")).strip()

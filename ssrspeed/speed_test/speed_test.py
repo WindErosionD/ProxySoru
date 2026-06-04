@@ -88,6 +88,41 @@ def _ntt_bind_host(internal_ip):
 	return internal_ip
 
 
+# 经 SOCKS UDP 转发时 CHANGE-REQUEST 常失败；备用 STUN 提高成功率
+_NTT_STUN_CANDIDATES = (
+	("stun.l.google.com", 19302),
+	("stun.cloudflare.com", 3478),
+	("stun.qq.com", 3478),
+)
+
+
+def _ntt_stun_candidates(configured_host, configured_port: int):
+	out = []
+	if configured_host:
+		out.append((configured_host, configured_port))
+	for item in _NTT_STUN_CANDIDATES:
+		if item not in out:
+			out.append(item)
+	return out
+
+
+def _ntt_coarse_nat(sock, stun_addr, source_ip, source_port):
+	"""
+	STUN 完整分类需 CHANGE-REQUEST；经代理 UDP 时该步常无响应。
+	仅用 Test1/2 做粗判，避免 pynat 抛 PynatError。
+	"""
+	response = pynat.stun_test_1(sock, stun_addr)
+	if not response:
+		return pynat.BLOCKED, None, None
+	ext_ip = response.get("ext_ip")
+	ext_port = response.get("ext_port")
+	if ext_ip == source_ip and ext_port == source_port:
+		topology = pynat.OPEN if pynat.stun_test_2(sock, stun_addr) else pynat.UDP_FIREWALL
+	else:
+		topology = pynat.FULL_CONE if pynat.stun_test_2(sock, stun_addr) else pynat.SYMMETRIC
+	return topology, ext_ip, ext_port
+
+
 class SpeedTest(object):
 	def __init__(self, parser, method = "ST_ASYNC", enable_topology = False):
 		self.__configs = parser.nodes
@@ -107,6 +142,8 @@ class SpeedTest(object):
 		self.__port_max_wait = float(perf_cfg.get("port_check_max_wait", 2.0))
 		self.__speed_zero_retry = bool(perf_cfg.get("speed_zero_retry", False))
 		self.__st_zero_retry_quick = bool(perf_cfg.get("st_zero_retry_quick", True))
+		self.__st_min_valid_bytes = int(perf_cfg.get("st_async_min_valid_bytes", 64 * 1024))
+		self.__skip_speed_when_gping_zero = bool(perf_cfg.get("skip_speed_when_gping_zero", True))
 		self.__results = []
 		self.__current = {}
 		self.__baseResult = {
@@ -531,12 +568,14 @@ class SpeedTest(object):
 		ntt = config.get("ntt") or {}
 		preferred_port = int(ntt.get("internal_port", 54320))
 		internal_ip = ntt.get("internal_ip", "0.0.0.0")
-		stun_host = ntt.get("stun_host") or None
-		stun_port = int(ntt.get("stun_port", 3478))
+		cfg_stun_host = ntt.get("stun_host") or None
+		cfg_stun_port = int(ntt.get("stun_port", 3478))
 		bind_host = _ntt_bind_host(internal_ip)
 
 		s = socks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
 		s.set_proxy(socks.PROXY_TYPE_SOCKS5, LOCAL_ADDRESS, LOCAL_PORT)
+		display_ip = None
+		bound_port = None
 		try:
 			try:
 				s.bind((bind_host, preferred_port))
@@ -558,18 +597,61 @@ class SpeedTest(object):
 				display_ip = bound_ip
 
 			logger.info("Performing UDP NAT Type Test (STUN via SOCKS5)")
-			t, eip, eport, _sip = pynat.get_ip_info(
-				source_ip=source_ip_for_pynat,
-				source_port=int(bound_port),
-				stun_host=stun_host,
-				stun_port=stun_port,
-				include_internal=True,
-				sock=s,
-			)
-			return t, eip, eport, display_ip, int(bound_port)
-		except Exception:
-			logger.exception("UDP NAT type test failed.")
-			return None, None, None, None, None
+			last_err = None
+			for stun_host, stun_port in _ntt_stun_candidates(cfg_stun_host, cfg_stun_port):
+				try:
+					t, eip, eport, _sip = pynat.get_ip_info(
+						source_ip=source_ip_for_pynat,
+						source_port=int(bound_port),
+						stun_host=stun_host,
+						stun_port=stun_port,
+						include_internal=True,
+						sock=s,
+					)
+					return t, eip, eport, display_ip, int(bound_port)
+				except pynat.PynatError as exc:
+					last_err = exc
+					logger.debug(
+						"STUN full classification failed via %s:%s: %s",
+						stun_host,
+						stun_port,
+						exc,
+					)
+					t, eip, eport = _ntt_coarse_nat(
+						s,
+						(stun_host, stun_port),
+						source_ip_for_pynat,
+						int(bound_port),
+					)
+					if t != pynat.BLOCKED:
+						logger.warning(
+							"UDP NAT: full STUN failed (%s); coarse result %s from %s:%s.",
+							exc,
+							t,
+							stun_host,
+							stun_port,
+						)
+						return t, eip, eport, display_ip, int(bound_port)
+				except OSError as exc:
+					last_err = exc
+					logger.debug(
+						"UDP NAT test I/O error via %s:%s: %s",
+						stun_host,
+						stun_port,
+						exc,
+					)
+
+			if last_err is not None:
+				logger.warning(
+					"UDP NAT type test unavailable through proxy UDP (%s).",
+					last_err,
+				)
+			else:
+				logger.warning("UDP NAT type test unavailable through proxy UDP.")
+			return None, None, None, display_ip, int(bound_port)
+		except OSError as ex:
+			logger.warning("UDP NAT type test setup failed: %s", ex)
+			return None, None, None, display_ip, bound_port
 		finally:
 			s.close()
 
@@ -702,16 +784,25 @@ class SpeedTest(object):
 							ntt_enabled = bool(config.get("ntt", {}).get("enabled"))
 							nat_result = None
 							testRes = None
-							with concurrent.futures.ThreadPoolExecutor(max_workers=2) as exe:
-								f_speed = exe.submit(st.startTest, self.__testMethod)
-								f_nat = None
-								if ntt_enabled and pynat:
-									f_nat = exe.submit(self.__nat_type_test)
-								elif ntt_enabled and not pynat:
-									nat_info += " - NAT Type: N/A (pynat missing)"
-								testRes = f_speed.result()
-								if f_nat is not None:
-									nat_result = f_nat.result()
+							_gping_ok = (_item.get("gPing") or 0) > 0
+							if self.__skip_speed_when_gping_zero and not _gping_ok:
+								logger.info(
+									"[{}] - [{}] skip speed/NAT: Google ping 0 (proxy path dead).",
+									_item["group"],
+									_item["remarks"],
+								)
+								testRes = (0, 0, [], 0)
+							else:
+								with concurrent.futures.ThreadPoolExecutor(max_workers=2) as exe:
+									f_speed = exe.submit(st.startTest, self.__testMethod)
+									f_nat = None
+									if ntt_enabled and pynat:
+										f_nat = exe.submit(self.__nat_type_test)
+									elif ntt_enabled and not pynat:
+										nat_info += " - NAT Type: N/A (pynat missing)"
+									testRes = f_speed.result()
+									if f_nat is not None:
+										nat_result = f_nat.result()
 							if nat_result is not None:
 								t, eip, eport, sip, sport = nat_result
 								_item["ntt"]["type"] = t
@@ -727,8 +818,12 @@ class SpeedTest(object):
 							if testRes is None:
 								logger.warning("startTest returned None; treating as zero speed.")
 								testRes = (0, 0, [], 0)
-							if self.__speed_zero_retry and int(testRes[0]) == 0:
-								logger.warning("Re-testing node after zero speed (hard restart Mihomo).")
+							if self.__speed_zero_retry and (testRes[3] or 0) < self.__st_min_valid_bytes:
+								logger.warning(
+									"Re-testing node after insufficient speed (%d bytes, need >= %d).",
+									testRes[3] or 0,
+									self.__st_min_valid_bytes,
+								)
 								if hasattr(client, "force_hard_restart"):
 									try:
 										client.force_hard_restart(cfg)
