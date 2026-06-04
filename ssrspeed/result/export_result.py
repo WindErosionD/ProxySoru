@@ -489,28 +489,9 @@ class ExportResult(object):
 		filename = "./results/" + group_name + time_suffix + fn_suffix + ".png"
 		resultImg.save(filename)
 		logger.info("Result image saved as %s" % filename)
-		self.__exportAsWebp(resultImg, filename)
 
 		if self.__enable_topology:
 			self.__exportTopologyPng(result, group_name, generatedTime)
-
-	def __exportAsWebp(self, result_img, png_filename):
-		"""额外输出 WebP 测速图（体积更小，仅测速主图）。"""
-		if not self.__config.get("webp", True):
-			return
-		try:
-			quality = int(self.__config.get("webpQuality", 86))
-		except (TypeError, ValueError):
-			quality = 86
-		quality = max(60, min(quality, 95))
-		webp_path = png_filename.rsplit(".", 1)[0] + ".webp"
-		save_kw = {"format": "WEBP", "quality": quality, "method": 6}
-		try:
-			result_img.save(webp_path, **save_kw)
-		except TypeError:
-			save_kw.pop("method", None)
-			result_img.save(webp_path, **save_kw)
-		logger.info("Result WebP saved as %s (quality=%d)", webp_path, quality)
 
 	def __exportTopologyPng(self, result, group_name, generated_time):
 		row_h = 30

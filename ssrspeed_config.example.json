@@ -65,6 +65,7 @@
 		"ping_max_total": 4,
 		"ping_max_fail": 2,
 		"speed_test_seconds": 8,
+		"speed_sample_interval_seconds": 0.35,
 		"skip_speed_when_gping_zero": true,
 		"aio_timeout_seconds": 16,
 		"aio_connect_timeout_seconds": 5,
@@ -91,8 +92,6 @@
 	},
 	"exportResult": {
 		"hide_max_speed": false,
-		"webp": true,
-		"webpQuality": 86,
 		"filenameSuffix": "",
 		"font": "./resources/fonts/SourceHanSansCN-Medium.otf",
 		"colors": [

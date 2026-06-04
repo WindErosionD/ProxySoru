@@ -37,6 +37,7 @@ _ST_ZERO_CONNECT = float(_PERF.get("st_zero_retry_connect_seconds", 4))
 _ST_ZERO_READ = float(_PERF.get("st_zero_retry_read_seconds", 6))
 _WIN_MAX_WORKERS = int(_PERF.get("st_async_windows_max_workers", 8))
 _ST_MIN_VALID_BYTES = int(_PERF.get("st_async_min_valid_bytes", 64 * 1024))
+_SPEED_SAMPLE_INTERVAL = float(_PERF.get("speed_sample_interval_seconds", 0.35))
 
 
 def _short_error(exc: BaseException) -> str:
@@ -150,10 +151,11 @@ class Statistics:
 		cur_time = time.time()
 		if not self._start_time:
 			self._start_time = cur_time
+			self._statistics_time = cur_time
 		delta_time = cur_time - self._statistics_time
 		self._time_used = cur_time - self._start_time
 		self._total_red += received
-		if delta_time > 0.5:
+		if delta_time >= _SPEED_SAMPLE_INTERVAL:
 			self._statistics_time = cur_time
 			try:
 				self._show_progress(delta_time)
@@ -171,6 +173,13 @@ class Statistics:
 			self._record(received)
 
 	def show_progress_full(self):
+		# 收尾窗口：避免测速结束前最后一段字节未计入采样
+		if self._start_time and self._time_used > 0 and self._total_red > self._delta_red:
+			tail = self._time_used - max(0.0, self._statistics_time - self._start_time)
+			if tail > 0.1:
+				tail_speed = (self._total_red - self._delta_red) / tail
+				if tail_speed > 0:
+					self._speed_list.append(tail_speed)
 		mb_red = self._total_red / 1024 / 1024
 		if self._time_used > 0:
 			avg_mbps = mb_red / self._time_used
@@ -179,8 +188,12 @@ class Statistics:
 		print("\r[" + "=" * self._count + "] [{:.2f} MB/s]".format(avg_mbps), end='\n')
 		logger.info("Fetched {:.2f} MB in {:.2f}s".format(mb_red, self._time_used))
 
-	def _show_progress(self, delta_time: int):
+	def _show_progress(self, delta_time: float):
+		if delta_time <= 0:
+			return
 		speed = (self._total_red - self._delta_red) / delta_time
+		if speed > 0:
+			self._speed_list.append(speed)
 		speed_mb = speed / 1024 / 1024
 		self._delta_red = self._total_red
 		self._count += 1
