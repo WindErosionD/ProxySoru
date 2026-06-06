@@ -787,9 +787,10 @@ class SpeedTest(object):
 							_gping_ok = (_item.get("gPing") or 0) > 0
 							if self.__skip_speed_when_gping_zero and not _gping_ok:
 								logger.info(
-									"[{}] - [{}] skip speed/NAT: Google ping 0 (proxy path dead).",
-									_item["group"],
-									_item["remarks"],
+									"[{}] - [{}] skip speed/NAT: Google ping 0 (proxy path dead).".format(
+										_item["group"],
+										_item["remarks"],
+									)
 								)
 								testRes = (0, 0, [], 0)
 							else:

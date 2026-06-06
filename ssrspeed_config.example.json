@@ -47,7 +47,8 @@
 	"steam": true,
 	"ig_audio": true,
 	"ig_audio_probe_shortcodes": [
-		"DHuyNBZSV_1"
+		"DH56yy7p3lZ",
+		"DOvzTywjPGN"
 	],
 	"topology": {
 		"enabled": false
@@ -179,7 +180,7 @@
 	},
 	"fileDownload": {
 		"maxWorkers": 12,
-		"buffer": 4096,
+		"buffer": 65536,
 		"skipRuleMatch": false,
 		"rules": [
 			{
