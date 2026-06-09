@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from html import unescape as html_unescape
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlsplit, urlparse
@@ -23,6 +24,7 @@ from .v2ray_parsers import ParserV2RayN, ParserV2RayQuantumult
 from .clash_parser import ParserClash
 from .node_filters import NodeFilter
 from .trojan_parser import TrojanParser
+from .singbox_parser import parse_singbox_subscription
 
 from config import config
 PROXY_SETTINGS = config["proxy"]
@@ -480,51 +482,72 @@ class UniversalParser:
 		curl_exe = shutil.which("curl")
 		if not curl_exe:
 			return ""
+		resolve_attempts = []
+		if resolve_entry:
+			resolve_attempts.append(resolve_entry)
+		resolve_attempts.append(None)
 		uas = (
 			"Mihomo/1.18.0",
 			"ClashMetaForAndroid/2.10.1.Meta",
 			"Stash/2.6.0",
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 		)
-		for ua in uas:
-			try:
-				cmd = [curl_exe, "-sS", "-L", "--max-time", "28", "--compressed"]
-				if not verify:
-					cmd.append("-k")
-				if PROXY_SETTINGS["enabled"]:
-					auth = ""
-					if PROXY_SETTINGS["username"]:
-						auth = "{}:{}@".format(
-							PROXY_SETTINGS["username"],
-							PROXY_SETTINGS["password"],
+		saw_transient = False
+		for resolve in resolve_attempts:
+			for ua in uas:
+				try:
+					cmd = [curl_exe, "-sS", "-L", "--max-time", "28", "--compressed", "-w", "\n%{http_code}"]
+					if not verify:
+						cmd.append("-k")
+					if PROXY_SETTINGS["enabled"]:
+						auth = ""
+						if PROXY_SETTINGS["username"]:
+							auth = "{}:{}@".format(
+								PROXY_SETTINGS["username"],
+								PROXY_SETTINGS["password"],
+							)
+						px = "socks5h://{}{}:{}".format(
+							auth,
+							PROXY_SETTINGS["address"],
+							PROXY_SETTINGS["port"],
 						)
-					px = "socks5h://{}{}:{}".format(
-						auth,
-						PROXY_SETTINGS["address"],
-						PROXY_SETTINGS["port"],
+						cmd.extend(["--proxy", px])
+					if resolve:
+						cmd.extend(["--resolve", resolve])
+					cmd.extend(["-H", "Accept: */*", "-A", ua, url])
+					cp = subprocess.run(cmd, capture_output=True, timeout=35)
+					if cp.returncode != 0:
+						logger.warning("curl exited %s for UA [%s]", cp.returncode, ua)
+						continue
+					raw = cp.stdout or b""
+					if len(raw) < 80:
+						continue
+					out = self.__subscription_bytes_to_text(raw).strip()
+					http_code = 0
+					if "\n" in out:
+						body, _, tail = out.rpartition("\n")
+						if tail.isdigit():
+							http_code = int(tail)
+							out = body.strip()
+					if len(out) < 80:
+						continue
+					if http_code and self.__is_transient_http_error(http_code):
+						saw_transient = True
+						logger.warning("curl HTTP %s for UA [%s].", http_code, ua)
+						continue
+					if self.__looks_like_html_response(out):
+						logger.warning("curl returned HTML-like body (len=%d) for UA [%s].", len(out), ua)
+						continue
+					logger.info(
+						"Subscription fetched via system curl (UA=%s, resolve=%s, %d chars).",
+						ua,
+						"yes" if resolve else "no",
+						len(out),
 					)
-					cmd.extend(["--proxy", px])
-				if resolve_entry:
-					cmd.extend(["--resolve", resolve_entry])
-				cmd.extend(["-H", "Accept: */*", "-A", ua, url])
-				cp = subprocess.run(cmd, capture_output=True, timeout=35)
-				if cp.returncode != 0:
-					logger.warning("curl exited %s for UA [%s]", cp.returncode, ua)
-					continue
-				raw = cp.stdout or b""
-				if len(raw) < 80:
-					continue
-				out = self.__subscription_bytes_to_text(raw).strip()
-				if len(out) < 80:
-					continue
-				if self.__looks_like_html_response(out):
-					logger.warning("curl returned HTML-like body (len=%d) for UA [%s].", len(out), ua)
-					continue
-				logger.info("Subscription fetched via system curl (UA=%s, raw=%d text=%d chars).", ua, len(raw), len(out))
-				return out
-			except Exception as e:
-				logger.warning("curl subscription fetch failed (%s): %s", ua, e.__class__.__name__)
-		return ""
+					return out
+				except Exception as e:
+					logger.warning("curl subscription fetch failed (%s): %s", ua, e.__class__.__name__)
+		return "transient" if saw_transient else ""
 
 	def __looks_like_ssl_failure(self, exc: BaseException) -> bool:
 		cur: Optional[BaseException] = exc
@@ -538,7 +561,107 @@ class UniversalParser:
 		msg = str(exc).lower()
 		return "ssl" in msg and ("error" in msg or "eof" in msg or "handshake" in msg)
 
-	def __fetch_subscription_via_browser_tls(self, url: str, verify: bool, resolve_entry: Optional[str] = None) -> str:
+	@staticmethod
+	def __is_transient_http_error(status: int) -> bool:
+		return status in (429, 502, 503, 504)
+
+	def __requests_proxies(self):
+		if not PROXY_SETTINGS["enabled"]:
+			return None
+		auth = ""
+		if PROXY_SETTINGS["username"]:
+			auth = "{}:{}@".format(
+				PROXY_SETTINGS["username"],
+				PROXY_SETTINGS["password"],
+			)
+		proxy = "socks5://{}{}:{}".format(
+			auth,
+			PROXY_SETTINGS["address"],
+			PROXY_SETTINGS["port"],
+		)
+		return {"http": proxy, "https": proxy}
+
+	def __subscription_body_usable(self, text: str) -> bool:
+		if not text or not text.strip():
+			return False
+		if self.__looks_like_html_response(text):
+			return False
+		return True
+
+	def __request_subscription_once(
+		self,
+		url: str,
+		header: dict,
+		verify: bool,
+		timeout: int,
+	) -> tuple:
+		proxies = self.__requests_proxies()
+		if proxies:
+			logger.info("Reading subscription via {}".format(proxies["https"]))
+			rep = requests.get(
+				url, headers=header, timeout=timeout, proxies=proxies, verify=verify
+			)
+		else:
+			rep = requests.get(url, headers=header, timeout=timeout, verify=verify)
+		rep.encoding = "utf-8"
+		return int(rep.status_code), rep.text or ""
+
+	def __fetch_subscription_via_requests(
+		self,
+		url: str,
+		headers_list: list,
+		verify: bool,
+		timeout: int,
+		retries_on_transient: int = 1,
+		ssl_state: Optional[dict] = None,
+	) -> str:
+		saw_transient = False
+		for header in headers_list:
+			for attempt in range(retries_on_transient + 1):
+				try:
+					status, text = self.__request_subscription_once(
+						url, header, verify, timeout
+					)
+					if status == 200 and self.__subscription_body_usable(text):
+						logger.info(
+							"Subscription fetched via requests (UA=%s), %d chars.",
+							header.get("User-Agent", "?"),
+							len(text),
+						)
+						return text
+					if self.__is_transient_http_error(status):
+						saw_transient = True
+					logger.warning(
+						"Subscription request not usable with UA [%s], status=%s, length=%d",
+						header.get("User-Agent", "?"),
+						status,
+						len(text),
+					)
+					if (
+						self.__is_transient_http_error(status)
+						and attempt < retries_on_transient
+					):
+						delay = 2 + attempt
+						logger.info(
+							"Transient HTTP %s; retrying subscription fetch in %ds.",
+							status,
+							delay,
+						)
+						time.sleep(delay)
+						continue
+					break
+				except Exception as e:
+					if ssl_state is not None and verify and self.__looks_like_ssl_failure(e):
+						ssl_state["had_ssl_failure"] = True
+					logger.warning(
+						"Subscription request failed with UA [%s]: %s",
+						header.get("User-Agent", "?"),
+						e.__class__.__name__,
+					)
+					break
+		return "transient" if saw_transient else ""
+
+	def __fetch_subscription_via_browser_tls(self, url: str, verify: bool, resolve_entry: Optional[str] = None, max_profiles: Optional[int] = None) -> str:
 		"""使用 curl_cffi 模拟真实浏览器 TLS/JA3 指纹（比仅改 User-Agent 更接近浏览器）。"""
 		try:
 			from curl_cffi import requests as brq
@@ -576,7 +699,9 @@ class UniversalParser:
 			"Cache-Control": "no-cache",
 			"Pragma": "no-cache",
 		}
-		for imp in impersonates:
+		imp_list = impersonates if max_profiles is None else impersonates[:max_profiles]
+		saw_transient = False
+		for imp in imp_list:
 			try:
 				br_kw = dict(
 					impersonate=imp,
@@ -610,6 +735,8 @@ class UniversalParser:
 						len(text),
 					)
 					return r.text or ""
+				if self.__is_transient_http_error(resp_sc):
+					saw_transient = True
 				logger.warning(
 					"Browser-TLS fetch (%s) not usable: status=%s len=%d",
 					imp,
@@ -618,14 +745,18 @@ class UniversalParser:
 				)
 			except Exception as e:
 				logger.warning("Browser-TLS fetch failed (%s): %s", imp, e.__class__.__name__)
-		return ""
+		return "transient" if saw_transient else ""
 
 	def __fetch_subscription_text(self, url: str) -> str:
 		# 部分机场对 python-requests 等 UA 返回 HTML/挑战页但仍为 200；勿在首次 200 就返回。
-		# 优先使用 Clash / Mihomo 等客户端 UA。
-		header_candidates = [
+		# sing-box / Clash 类订阅优先走轻量 requests，避免先连打 8 次 Browser-TLS 触发 502/限流。
+		ssl_state = {"had_ssl_failure": False}
+		fast_headers = [
 			{"User-Agent": "Mihomo/1.18.0", "Accept": "*/*"},
 			{"User-Agent": "ClashMetaForAndroid/2.10.1.Meta", "Accept": "*/*"},
+			{"User-Agent": "sing-box/1.12.0", "Accept": "application/json,*/*"},
+		]
+		header_candidates = [
 			{"User-Agent": "clash-verge/v1.7.7", "Accept": "*/*"},
 			{"User-Agent": "ClashForWindows/0.20.39", "Accept": "*/*"},
 			{"User-Agent": "FlClash/v0.8.0", "Accept": "*/*"},
@@ -637,10 +768,8 @@ class UniversalParser:
 				"Accept": "text/plain,application/yaml,text/yaml,application/json,text/html;q=0.8,*/*;q=0.5",
 			},
 		]
-		last_status = 0
-		last_err = None
-		had_ssl_failure = False
 		last_200_text = ""
+		saw_transient = False
 		resolve_entry = None
 		try:
 			resolve_entry = subscription_resolve_entry(url)
@@ -653,112 +782,96 @@ class UniversalParser:
 
 		for verify in (True, False):
 			if not verify:
-				if not had_ssl_failure:
+				if not ssl_state.get("had_ssl_failure"):
 					break
 				logger.warning(
 					"Retrying subscription HTTPS with verify=False after SSL handshake/verify errors."
 				)
-			if resolve_entry:
-				curl_first = self.__fetch_subscription_via_system_curl(url, verify, resolve_entry)
-				if curl_first.strip():
-					last_200_text = curl_first
-					if not self.__looks_like_html_response(curl_first):
-						logger.info(
-							"Subscription fetched early via system curl + DoH resolve (%d chars).",
-							len(curl_first),
-						)
-						return curl_first
-			br_text = self.__fetch_subscription_via_browser_tls(url, verify=verify, resolve_entry=resolve_entry)
-			if br_text.strip():
-				last_200_text = br_text
-				if not self.__looks_like_html_response(br_text):
-					return br_text
-				logger.warning(
-					"Browser-TLS body still looks like HTML/WAF (len=%d); trying requests/curl.",
-					len(br_text),
+
+			req_text = self.__fetch_subscription_via_requests(
+				url, fast_headers, verify, sub_http_to, retries_on_transient=1, ssl_state=ssl_state
+			)
+			if req_text and req_text != "transient":
+				return req_text
+			if req_text == "transient":
+				saw_transient = True
+
+			br_profiles = 2 if saw_transient else None
+			for resolve in ([resolve_entry, None] if resolve_entry else [None]):
+				if resolve is None and resolve_entry:
+					logger.info("Retrying subscription fetch without DoH host pin.")
+				br_text = self.__fetch_subscription_via_browser_tls(
+					url, verify=verify, resolve_entry=resolve, max_profiles=br_profiles
 				)
-			for header in header_candidates:
-				try:
-					if PROXY_SETTINGS["enabled"]:
-						auth = ""
-						if PROXY_SETTINGS["username"]:
-							auth = "{}:{}@".format(
-								PROXY_SETTINGS["username"],
-								PROXY_SETTINGS["password"]
-							)
-						proxy = "socks5://{}{}:{}".format(
-							auth,
-							PROXY_SETTINGS["address"],
-							PROXY_SETTINGS["port"]
-						)
-						proxies = {
-							"http": proxy,
-							"https": proxy
-						}
-						logger.info("Reading subscription via {}".format(proxy))
-						rep = requests.get(
-							url, headers=header, timeout=sub_http_to, proxies=proxies, verify=verify
-						)
-					else:
-						rep = requests.get(url, headers=header, timeout=sub_http_to, verify=verify)
-					last_status = rep.status_code
-					rep.encoding = "utf-8"
-					text = rep.text or ""
-					if rep.status_code == 200 and text.strip():
-						last_200_text = text
-						if self.__looks_like_html_response(text):
-							logger.warning(
-								"Subscription returned HTML/challenge with UA [%s] (len=%d); trying next UA.",
-								header["User-Agent"],
-								len(text),
-							)
-							continue
-						return text
+				if br_text and br_text != "transient":
+					last_200_text = br_text
+					if self.__subscription_body_usable(br_text):
+						return br_text
 					logger.warning(
-						"Subscription request not usable with UA [%s], status=%s, length=%d",
-						header["User-Agent"],
-						rep.status_code,
-						len(text),
+						"Browser-TLS body still looks like HTML/WAF (len=%d); trying requests/curl.",
+						len(br_text),
 					)
-				except Exception as e:
-					last_err = e
-					if verify and self.__looks_like_ssl_failure(e):
-						had_ssl_failure = True
-					logger.warning(
-						"Subscription request failed with UA [%s]: %s",
-						header["User-Agent"],
-						e.__class__.__name__,
-					)
+				if br_text == "transient":
+					saw_transient = True
+
+			req_text = self.__fetch_subscription_via_requests(
+				url,
+				header_candidates,
+				verify,
+				sub_http_to,
+				retries_on_transient=1 if saw_transient else 0,
+				ssl_state=ssl_state,
+			)
+			if req_text and req_text != "transient":
+				return req_text
+			if req_text == "transient":
+				saw_transient = True
+
 			curl_text = self.__fetch_subscription_via_system_curl(url, verify, resolve_entry)
-			if curl_text.strip():
+			if curl_text and curl_text != "transient":
 				last_200_text = curl_text
-				if not self.__looks_like_html_response(curl_text):
-					logger.info("System curl returned usable subscription body (%d bytes).", len(curl_text))
+				if self.__subscription_body_usable(curl_text):
 					return curl_text
 				logger.warning(
 					"System curl body still looks like HTML/WAF (%d bytes).",
 					len(curl_text),
 				)
+			if curl_text == "transient":
+				saw_transient = True
+
 			sess_text = self.__fetch_subscription_via_session(url, verify=verify)
 			if sess_text.strip():
 				last_200_text = sess_text
-				if not self.__looks_like_html_response(sess_text):
+				if self.__subscription_body_usable(sess_text):
 					logger.info("Session warm-up fetch returned usable subscription body (%d bytes).", len(sess_text))
 					return sess_text
 				logger.warning(
 					"Session warm-up fetch still looks like HTML/WAF (%d bytes); continuing.",
 					len(sess_text),
 				)
+
+			if saw_transient:
+				logger.info("Waiting 3s before final subscription retry after transient HTTP errors.")
+				time.sleep(3)
+				final = self.__fetch_subscription_via_requests(
+					url, fast_headers[:1], verify, sub_http_to, retries_on_transient=0
+				)
+				if final and final != "transient":
+					return final
+
 		if last_200_text.strip():
 			logger.warning(
 				"Using last HTTP 200 body (%d bytes) despite HTML/WAF heuristics; will try parse / HTML unwrap.",
 				len(last_200_text),
 			)
 			return last_200_text
-		if last_err:
-			logger.error("Subscription request failed after retries: %s", str(last_err))
+		elif saw_transient:
+			logger.error(
+				"Subscription request failed after retries: upstream returned 502/503/504 (Bad Gateway). "
+				"订阅服务器暂时不可用或被 CDN 拦截；请稍后重试，或在浏览器打开链接另存为本地文件再测速。"
+			)
 		else:
-			logger.error("Subscription request failed after retries, last status: %s", last_status)
+			logger.error("Subscription request failed after retries.")
 		return ""
 	
 	def filter_nodes(self, fk=[], fgk=[], frk=[], ek=[], egk=[], erk=[]):
@@ -893,6 +1006,13 @@ class UniversalParser:
 					pass
 			if parsed: continue
 
+			# sing-box JSON subscription (format=singbox 等)
+			singbox_cfgs = parse_singbox_subscription(rep)
+			if singbox_cfgs:
+				for cfg in singbox_cfgs:
+					self.__nodes.append(NodeMihomo(cfg))
+				continue
+
 			#Try Clash Parser
 			clash_nodes = self.__parse_clash(rep)
 			if clash_nodes:
@@ -932,7 +1052,9 @@ class UniversalParser:
 				except Exception:
 					logger.exception("Nested subscription fallback failed.")
 			else:
-				logger.error("Subscription format not recognized (not base64 links / SSD / Clash YAML).")
+				logger.error(
+					"Subscription format not recognized (not base64 links / SSD / sing-box JSON / Clash YAML)."
+				)
 
 
 	def read_gui_config(self, filename: str):
@@ -942,6 +1064,11 @@ class UniversalParser:
 		try:
 			#Try Load as Json
 			data = json.loads(raw_data)
+			singbox_cfgs = parse_singbox_subscription(raw_data)
+			if singbox_cfgs:
+				for cfg in singbox_cfgs:
+					self.__nodes.append(NodeMihomo(cfg))
+				return
 			#Identification of proxy type
 			#Shadowsocks(D)
 			if (
