@@ -1,6 +1,7 @@
 #coding:utf-8
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,44 @@ from config import config, PROJECT_ROOT
 logger = logging.getLogger("Sub")
 
 _CFG_PATH = os.path.join(PROJECT_ROOT, "config_mihomo.yaml")
+
+# Go YAML（Mihomo）会把未加引号的 06929565 等当成数字，导致 short-id 非法。
+_YAML_AMBIGUOUS_STR = re.compile(
+	r"^(?:"
+	r"[-+]?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?"
+	r"|0[0-9a-fA-F]+"
+	r"|0x[0-9a-fA-F]+"
+	r"|true|false|null|yes|no|on|off|~"
+	r")$",
+	re.IGNORECASE,
+)
+
+
+class _MihomoYamlDumper(yaml.SafeDumper):
+	pass
+
+
+def _represent_mihomo_str(dumper, data: str):
+	style = None
+	if (
+		not data
+		or data != data.strip()
+		or _YAML_AMBIGUOUS_STR.match(data)
+		or any(ch in data for ch in "*&!%@:?{}[]|>'\"#,\\")
+	):
+		style = '"'
+	return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_MihomoYamlDumper.add_representer(str, _represent_mihomo_str)
+
+
+def _node_needs_ninja_core(cfg: dict) -> bool:
+	if not isinstance(cfg, dict):
+		return False
+	if (cfg.get("type") or "").lower() == "ninja":
+		return True
+	return bool(cfg.get("_ninja_pass_info"))
 
 
 def _perf() -> dict:
@@ -138,6 +177,9 @@ class Mihomo(BaseClient):
 		self._delay_test_url = str(
 			_perf().get("mihomo_delay_test_url", "http://www.gstatic.com/generate_204")
 		)
+		self._prefer_ninja_core = False
+		self._ninja_pass_info = ""
+		self._logged_binary = False
 		self._stderr_file = None
 
 	def __api_headers(self):
@@ -258,33 +300,70 @@ class Mihomo(BaseClient):
 		)
 		return False
 
-	def __find_binary(self):
-		if self._binary:
-			return self._binary
+	def __find_binary(self, prefer_ninja: bool = False):
+		need_ninja = prefer_ninja or self._prefer_ninja_core
 		root = PROJECT_ROOT
 		if self._checkPlatform() == "Windows":
-			candidates = [
+			ninja_candidates = [
+				os.path.join(root, "clients", "ninja", "ninja.exe"),
+				os.path.join(root, "clients", "mihomo-ninja", "ninja.exe"),
+				os.path.join(root, "clients", "mihomo-ninja", "mihomo.exe"),
+			]
+			stock_candidates = [
 				os.path.join(root, "clients", "mihomo", "mihomo.exe"),
 				os.path.join(root, "clients", "clash-meta", "mihomo.exe"),
 				os.path.join(root, "clients", "clash", "mihomo.exe"),
 			]
-			which_candidates = ["mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta", "clash.exe", "clash"]
+			which_ninja = ["ninja.exe", "ninja"]
+			which_stock = ["mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta", "clash.exe", "clash"]
 		elif self._checkPlatform() in ("Linux", "MacOS"):
-			candidates = [
+			ninja_candidates = [
+				os.path.join(root, "clients", "ninja", "ninja"),
+				os.path.join(root, "clients", "mihomo-ninja", "ninja"),
+				os.path.join(root, "clients", "mihomo-ninja", "mihomo"),
+			]
+			stock_candidates = [
 				os.path.join(root, "clients", "mihomo", "mihomo"),
 				os.path.join(root, "clients", "clash-meta", "mihomo"),
 				os.path.join(root, "clients", "clash", "mihomo"),
 			]
-			which_candidates = ["mihomo", "clash-meta", "clash"]
+			which_ninja = ["ninja"]
+			which_stock = ["mihomo", "clash-meta", "clash"]
 		else:
 			logger.critical("Your system does not supported.Please contact developer.")
 			sys.exit(1)
 
-		for binary in candidates:
-			if os.path.isfile(binary):
-				self._binary = os.path.normpath(binary)
+		ordered = (ninja_candidates + stock_candidates) if need_ninja else (stock_candidates + ninja_candidates)
+		which_ordered = (which_ninja + which_stock) if need_ninja else (which_stock + which_ninja)
+
+		# 若当前进程已用某内核，且仍可用，尽量复用（避免无切换）
+		if self._binary and os.path.isfile(self._binary):
+			is_ninja_bin = "ninja" in os.path.basename(self._binary).lower()
+			if need_ninja and is_ninja_bin:
 				return self._binary
-		for binary in which_candidates:
+			if (not need_ninja) and (not is_ninja_bin):
+				return self._binary
+
+		for binary in ordered:
+			if os.path.isfile(binary):
+				chosen = os.path.normpath(binary)
+				if need_ninja and "ninja" not in os.path.basename(chosen).lower():
+					# 需要 ninja 协议却只找到公版内核时继续找
+					continue
+				self._binary = chosen
+				return self._binary
+		if need_ninja:
+			# 回退：找不到专用内核时用公版（会在加载 type:ninja 时报错）
+			for binary in stock_candidates:
+				if os.path.isfile(binary):
+					self._binary = os.path.normpath(binary)
+					logger.warning(
+						"未找到 Ninja 内核，回退使用公版 Mihomo：%s（type:ninja 节点将无法测速）。"
+						"请将 ninja.exe 放入 clients/ninja/，见 clients/ninja/README.md",
+						self._binary,
+					)
+					return self._binary
+		for binary in which_ordered:
 			which_res = shutil.which(binary)
 			if which_res:
 				self._binary = os.path.normpath(which_res)
@@ -292,7 +371,30 @@ class Mihomo(BaseClient):
 		return None
 
 	def __runtime_yaml_text(self, runtime_cfg: dict) -> str:
-		return yaml.safe_dump(runtime_cfg, allow_unicode=True, sort_keys=False)
+		body = yaml.dump(
+			runtime_cfg,
+			Dumper=_MihomoYamlDumper,
+			allow_unicode=True,
+			sort_keys=False,
+		)
+		pass_info = (self._ninja_pass_info or "").strip()
+		if pass_info:
+			# 保留订阅中的 #!PASS-INFO，供 ninja 内核 ProcessNinjaObfuscation 还原混淆节点
+			return pass_info + "\n" + body
+		return body
+
+	def __stderr_tail(self, max_chars: int = 1200) -> str:
+		path = self.__mihomo_stderr_path()
+		try:
+			if self._stderr_file is not None:
+				self._stderr_file.flush()
+			with open(path, "r", encoding="utf-8", errors="replace") as f:
+				text = f.read()
+			if not text.strip():
+				return ""
+			return text[-max_chars:].strip()
+		except OSError:
+			return ""
 
 	def __write_runtime_config(self, runtime_cfg: dict):
 		text = self.__runtime_yaml_text(runtime_cfg)
@@ -407,13 +509,17 @@ class Mihomo(BaseClient):
 		pop_kw = {"cwd": PROJECT_ROOT}
 		err_path = self.__mihomo_stderr_path()
 		try:
-			err_f = open(err_path, "a", encoding="utf-8", errors="replace")
-			err_f.write("\n--- Mihomo start {} ---\n".format(time.strftime("%Y-%m-%d %H:%M:%S")))
-			err_f.flush()
+			# 二进制追加；Ninja/Mihomo 日志多走 stdout，一并接入同一文件
+			err_f = open(err_path, "ab", buffering=0)
+			err_f.write(
+				("\n--- Mihomo start {} ---\n".format(time.strftime("%Y-%m-%d %H:%M:%S"))).encode(
+					"utf-8", "replace"
+				)
+			)
 			self._stderr_file = err_f
 			self._process = subprocess.Popen(
 				cmd,
-				stdout=subprocess.DEVNULL,
+				stdout=err_f,
 				stderr=err_f,
 				**pop_kw,
 			)
@@ -426,7 +532,12 @@ class Mihomo(BaseClient):
 		deadline = time.time() + max(self._api_timeout * 3, 8.0)
 		while time.time() < deadline:
 			if self._process and self._process.poll() is not None:
-				raise OSError("Mihomo exited during {}.".format(label))
+				code = self._process.returncode
+				tail = self.__stderr_tail()
+				detail = "Mihomo exited during {} (code={}).".format(label, code)
+				if tail:
+					detail = "{}\n--- mihomo stderr ---\n{}".format(detail, tail)
+				raise OSError(detail)
 			if self.__api_ready():
 				return
 			time.sleep(0.1)
@@ -450,25 +561,36 @@ class Mihomo(BaseClient):
 		runtime_cfg: dict = None,
 		force_restart: bool = False,
 	):
-		binary = self.__find_binary()
+		need_ninja = self._prefer_ninja_core or (proxy_cfg.get("type") or "").lower() == "ninja"
+		prev_binary = self._binary
+		binary = self.__find_binary(prefer_ninja=need_ninja)
 		if not binary:
 			logger.error(
-				"未找到 Mihomo / Clash Meta 可执行文件。请将内核放入 clients/mihomo/ 或加入 PATH。"
-				"说明见: clients/mihomo/README.md"
+				"未找到 Mihomo / Clash Meta / Ninja 可执行文件。请将内核放入 clients/mihomo/ 或 clients/ninja/，"
+				"或加入 PATH。说明见: clients/mihomo/README.md / clients/ninja/README.md"
 			)
 			sys.exit(1)
 
+		# 公版 <-> ninja 内核切换时必须冷启动
+		if prev_binary and os.path.normpath(prev_binary) != os.path.normpath(binary):
+			force_restart = True
+			if self._process is not None:
+				logger.info("Switching core binary: %s -> %s", prev_binary, binary)
+				self.stopClient()
+				self._binary = binary
+
 		if self._process is None:
-			if not self._binary:
+			if not getattr(self, "_logged_binary", False):
 				ver = _probe_mihomo_version_line(binary)
 				if ver:
-					logger.info("Mihomo 可执行文件: %s | %s", binary, ver)
+					logger.info("代理内核: %s | %s", binary, ver)
 				else:
 					logger.info(
-						"Mihomo 可执行文件: %s（未能读取版本，可手动执行 \"%s -v\"）",
+						"代理内核: %s（未能读取版本，可手动执行 \"%s -v\"）",
 						binary,
 						binary,
 					)
+				self._logged_binary = True
 			self.__spawn_process(binary)
 			logger.info(
 				"Starting mihomo with server %s:%d",
@@ -479,6 +601,9 @@ class Mihomo(BaseClient):
 			self.__select_proxy(proxy_cfg.get("name", ""))
 			return
 
+		# Ninja 混淆节点热重载常丢 PASS-INFO / 还原异常，统一冷启动更稳
+		if need_ninja:
+			force_restart = True
 		use_restart = force_restart or not _mihomo_hot_reload_enabled()
 		if self._hard_restart_every > 0:
 			self._nodes_since_start += 1
@@ -506,6 +631,9 @@ class Mihomo(BaseClient):
 
 	def force_hard_restart(self, config: dict):
 		"""0 速重试等场景：跳过热重载，强制冷启动当前节点。"""
+		if _node_needs_ninja_core(config):
+			self._prefer_ninja_core = True
+			self._ninja_pass_info = config.get("_ninja_pass_info") or self._ninja_pass_info
 		proxy_cfg = config_to_mihomo_proxy(config)
 		runtime_cfg = self.__build_runtime_config(proxy_cfg)
 		self.__write_runtime_config(runtime_cfg)
@@ -513,6 +641,11 @@ class Mihomo(BaseClient):
 
 	def startClient(self, config={}):
 		self._config = config
+		if _node_needs_ninja_core(config):
+			self._prefer_ninja_core = True
+			info = config.get("_ninja_pass_info") or ""
+			if info:
+				self._ninja_pass_info = info
 		try:
 			proxy_cfg = config_to_mihomo_proxy(config)
 		except Exception:

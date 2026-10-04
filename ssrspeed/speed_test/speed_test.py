@@ -785,7 +785,10 @@ class SpeedTest(object):
 							nat_result = None
 							testRes = None
 							_gping_ok = (_item.get("gPing") or 0) > 0
-							if self.__skip_speed_when_gping_zero and not _gping_ok:
+							_proxy_path_dead = bool(
+								self.__skip_speed_when_gping_zero and not _gping_ok
+							)
+							if _proxy_path_dead:
 								logger.info(
 									"[{}] - [{}] skip speed/NAT: Google ping 0 (proxy path dead).".format(
 										_item["group"],
@@ -819,7 +822,12 @@ class SpeedTest(object):
 							if testRes is None:
 								logger.warning("startTest returned None; treating as zero speed.")
 								testRes = (0, 0, [], 0)
-							if self.__speed_zero_retry and (testRes[3] or 0) < self.__st_min_valid_bytes:
+							# 代理通路已死时不要再硬重启+全量 ST_ASYNC 重试（极耗时）
+							if (
+								self.__speed_zero_retry
+								and not _proxy_path_dead
+								and (testRes[3] or 0) < self.__st_min_valid_bytes
+							):
 								logger.warning(
 									"Re-testing node after insufficient speed (%d bytes, need >= %d).",
 									testRes[3] or 0,

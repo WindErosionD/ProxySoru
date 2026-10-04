@@ -3,7 +3,7 @@
 ## 快速开始（Windows）
 
 1. 安装 [Python 3.10+](https://www.python.org/downloads/)，在项目根目录执行：`pip install -r requirements.txt`
-2. **Mihomo 内核已内置**于 `clients/mihomo/mihomo.exe`，克隆后即可使用
+2. **Mihomo 内核已内置**于 `clients/mihomo/mihomo.exe`，克隆后即可使用；若测 **Ninja** 协议，另需 `clients/ninja/ninja.exe`（见 [clients/ninja/README.md](clients/ninja/README.md)）
 3. 首次运行会自动从 `ssrspeed_config.example.json` 生成 `ssrspeed_config.json`
 4. 测速（需自备订阅或本地节点配置）：
 
@@ -12,6 +12,12 @@ python main.py -u "你的订阅链接"
 ```
 
 或使用本地 Clash 配置：`python main.py -c 你的配置.yaml`
+
+Ninja 订阅若远程拉失败（如 `Access denied`），可先在浏览器/官方客户端打开链接另存为 `.yaml`，再：
+
+```bat
+python main.py -u "E:\path\to\ninja_sub.yaml"
+```
 
 也可双击 `一键测速.bat`（需在命令行传入 `-u` / `-c` 等参数，或自行修改启动脚本）。
 
@@ -24,6 +30,7 @@ python main.py -u "你的订阅链接"
 | `config_mihomo.yaml.example` | 是 | 运行时配置格式参考 |
 | `config_mihomo.yaml` | 否（运行时生成） | 含节点敏感信息 |
 
-## Mihomo 内核
+## Mihomo / Ninja 内核
 
-详见 [clients/mihomo/README.md](clients/mihomo/README.md)。
+- 公版协议：详见 [clients/mihomo/README.md](clients/mihomo/README.md)
+- Ninja 协议：详见 [clients/ninja/README.md](clients/ninja/README.md)

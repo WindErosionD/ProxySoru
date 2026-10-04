@@ -748,16 +748,16 @@ def run_main(quiet=False, skip_start_banner=False):
 		)
 		print("", flush=True)
 	while True:
-		sub_url = input("请输入订阅链接（必填，输入 e/q 退出）: ").strip()
+		sub_url = input("请输入订阅链接或本地订阅文件路径（必填，输入 e/q 退出）: ").strip()
 		if sub_url.lower() in ("e", "q"):
 			return 0
 		while not sub_url:
-			sub_url = input("订阅链接不能为空，请重新输入（输入 e/q 退出）: ").strip()
+			sub_url = input("订阅链接/文件路径不能为空，请重新输入（输入 e/q 退出）: ").strip()
 			if sub_url.lower() in ("e", "q"):
 				return 0
 
 		test_name = input("请输入测速名称（选填，用于结果文件名）: ").strip()
-		topo_raw = input("是否开启拓扑测试？(默认开启，输入 n 关闭): ").strip().lower()
+		topo_raw = input("是否开启拓扑测试？(y/n): ").strip().lower()
 		enable_topology = topo_raw not in ("n",)
 
 		extra_args = ["-u", sub_url, "-y", "--skip-requirements-check", "-m", "stasync", "-M", "all"]

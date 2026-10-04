@@ -125,11 +125,16 @@ ssrspeed_config.json
 ssrspeed_config.local.json
 ssrspeed_config.*.local.json
 
-# Mihomo 测速时自动写入，含节点 UUID / 密码 / plugin-opts
+# Mihomo 测速时自动写入，含节点 UUID / 密码 / plugin-opts / PASS-INFO
 config_mihomo.yaml
+config_mihomo*.yaml
 config.yaml
 config.yml
 profiles/
+
+# Mihomo / Ninja 运行时缓存（cwd 下自动生成）
+cache.db
+**/cache.db
 
 # 测速结果 JSON/图片/HTML（含节点名、IP、速度等）
 results/
@@ -147,6 +152,7 @@ PORTABLE_BUILD
 .ssrspeed_req.sha256
 
 # 本地保存的订阅 / Clash / GUI / 节点列表（-c 导入或手存）
+# 注意：任何含真实订阅 token / 节点密码的文件都不要提交
 gui-config.json
 guiConfig.json
 proxies.yaml
@@ -159,6 +165,10 @@ subscription*.txt
 subscription*.yaml
 subscription*.yml
 *-subscription.*
+*_sub_raw.*
+*_sub_dump.*
+ninja_ok.yaml
+ninja_sub.yaml
 sub.txt
 sub.yaml
 sub.yml
@@ -177,6 +187,21 @@ links.txt
 *.iml
 .vscode/
 !.vscode/extensions.json
+
+# 调试脚本：tools/_*.py 常硬编码订阅链接/token，默认不提交
+tools/_*.py
+tools/_*/
+tools/_*.yaml
+tools/_*.yml
+tools/_*.json
+tools/_*.txt
+
+# Ninja 目录：只跟踪说明 / 版本 / 内核；其余为本地安装包、测订阅产物
+clients/ninja/*
+!clients/ninja/README.md
+!clients/ninja/VERSION
+!clients/ninja/ninja.exe
+!clients/ninja/ninja
 
 # 调试与临时文件（仅仓库根目录，勿误伤 __init__.py）
 /_*

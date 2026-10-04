@@ -115,6 +115,38 @@ def _is_ipv4(s: str) -> bool:
 		return False
 
 
+def is_fake_ip(ip: str) -> bool:
+	"""Clash/Mihomo fake-ip 或本机占位地址，不能用于直连订阅。"""
+	if not ip or not _is_ipv4(ip):
+		return False
+	parts = [int(x) for x in ip.split(".")]
+	if parts[0] == 127:
+		return True
+	if parts[0] == 198 and 18 <= parts[1] <= 19:
+		return True
+	if ip in ("0.0.0.0", "255.255.255.255"):
+		return True
+	return False
+
+
+def _system_dns_ipv4(hostname: str) -> Optional[str]:
+	if not hostname:
+		return None
+	sys_timeout = float(_dns_config().get("system_dns_timeout_seconds", 3))
+	try:
+		with ThreadPoolExecutor(max_workers=1) as ex:
+			fut = ex.submit(socket.gethostbyname, hostname.strip())
+			ip = fut.result(timeout=max(0.5, sys_timeout))
+	except (FuturesTimeout, OSError):
+		return None
+	return ip if _is_ipv4(ip) else None
+
+
+def system_dns_looks_like_fake_ip(hostname: str) -> bool:
+	ip = _system_dns_ipv4(hostname)
+	return bool(ip and is_fake_ip(ip))
+
+
 def resolve_ipv4_multi_doh(hostname: str) -> Optional[str]:
 	"""并行查询多个 DoH，按一致性与优先级选出 IPv4；失败返回 None。"""
 	if not hostname:
@@ -225,6 +257,19 @@ def subscription_resolve_entry(url: str) -> Optional[str]:
 		return None
 	ip = resolve_ipv4_best(host)
 	if not ip:
+		sys_ip = _system_dns_ipv4(host)
+		if sys_ip and not is_fake_ip(sys_ip):
+			logger.info("Subscription DoH unavailable; using system DNS %s -> %s", host, sys_ip)
+			ip = sys_ip
+	if not ip:
+		sys_ip = _system_dns_ipv4(host)
+		if sys_ip and is_fake_ip(sys_ip):
+			logger.warning(
+				"System DNS for %s -> %s looks like Clash/Mihomo fake-ip; "
+				"subscription fetch may fail until TUN is off or proxy is enabled in ssrspeed_config.json.",
+				host,
+				sys_ip,
+			)
 		return None
 	if p.scheme == "https":
 		port = p.port or 443

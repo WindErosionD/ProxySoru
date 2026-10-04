@@ -9,6 +9,8 @@ logger = logging.getLogger("Sub")
 # 排除信息节点/广告节点：匹配备注名（remarks/name）
 _EXCLUDE_REMARK_REGEX = (
 	re.compile(r"(流量|套餐|重置|到期|过期|官网|网址|地址|订阅)"),
+	re.compile(r"(更换客户端|请更换|TG群|返佣|邀请好友|telegram)", re.I),
+	re.compile(r"https?://t\.me/", re.I),
 	re.compile(r"\d{4}-\d{1,2}-\d{1,2}"),
 	re.compile(r"\d+\s*天"),
 	re.compile(r"[A-Za-z0-9-]+\.[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),

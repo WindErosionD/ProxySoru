@@ -21,6 +21,7 @@ class RequirementsCheck(object):
 
 	def _candidates_windows(self):
 		return [
+			os.path.join(self._root, "clients", "ninja", "ninja.exe"),
 			os.path.join(self._root, "clients", "mihomo", "mihomo.exe"),
 			os.path.join(self._root, "clients", "clash-meta", "mihomo.exe"),
 			os.path.join(self._root, "clients", "clash", "mihomo.exe"),
@@ -28,6 +29,7 @@ class RequirementsCheck(object):
 
 	def _candidates_unix(self):
 		return [
+			os.path.join(self._root, "clients", "ninja", "ninja"),
 			os.path.join(self._root, "clients", "mihomo", "mihomo"),
 			os.path.join(self._root, "clients", "clash-meta", "mihomo"),
 			os.path.join(self._root, "clients", "clash", "mihomo"),
@@ -35,8 +37,17 @@ class RequirementsCheck(object):
 
 	def _which_names(self):
 		if check_platform() == "Windows":
-			return ("mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta", "clash.exe", "clash")
-		return ("mihomo", "clash-meta", "clash")
+			return (
+				"ninja.exe",
+				"ninja",
+				"mihomo.exe",
+				"mihomo",
+				"clash-meta.exe",
+				"clash-meta",
+				"clash.exe",
+				"clash",
+			)
+		return ("ninja", "mihomo", "clash-meta", "clash")
 
 	def _find_mihomo_binary(self):
 		if check_platform() == "Windows":
@@ -45,9 +56,23 @@ class RequirementsCheck(object):
 			cands = self._candidates_unix()
 		else:
 			return None
+		# 公版优先用于常规自检；ninja 存在时额外提示
+		stock = None
+		ninja = None
 		for p in cands:
-			if os.path.isfile(p):
-				return os.path.normpath(p)
+			if not os.path.isfile(p):
+				continue
+			name = os.path.basename(p).lower()
+			if "ninja" in name and not ninja:
+				ninja = os.path.normpath(p)
+			elif not stock:
+				stock = os.path.normpath(p)
+		if stock:
+			self._ninja_binary = ninja
+			return stock
+		if ninja:
+			self._ninja_binary = ninja
+			return ninja
 		for name in self._which_names():
 			w = shutil.which(name)
 			if w:
@@ -77,11 +102,12 @@ class RequirementsCheck(object):
 		if pf == "Unknown":
 			logger.critical("Unsupported platform.")
 			sys.exit(1)
+		self._ninja_binary = None
 		bin_path = self._find_mihomo_binary()
 		if not bin_path:
 			logger.error(
-				"未找到 Mihomo / Clash Meta 可执行文件。请将内核放入 clients/mihomo/ 或加入 PATH，"
-				"详见 clients/mihomo/README.md"
+				"未找到 Mihomo / Clash Meta / Ninja 可执行文件。请将内核放入 clients/mihomo/ "
+				"或 clients/ninja/，或加入 PATH。详见 clients/mihomo/README.md / clients/ninja/README.md"
 			)
 			return
 		logger.info("Mihomo 内核路径: %s", bin_path)
@@ -90,3 +116,16 @@ class RequirementsCheck(object):
 			logger.info("Mihomo 版本信息: %s", ver)
 		else:
 			logger.warning("无法读取 Mihomo 版本（可忽略）；可手动执行: \"%s -v\"", bin_path)
+		ninja = getattr(self, "_ninja_binary", None)
+		if ninja and os.path.normpath(ninja) != os.path.normpath(bin_path):
+			nver = self._probe_version(ninja)
+			logger.info("Ninja 内核路径: %s%s", ninja, (" | " + nver) if nver else "")
+		elif not ninja:
+			# 再扫一遍专用目录，方便提示
+			win = os.path.join(self._root, "clients", "ninja", "ninja.exe")
+			unix = os.path.join(self._root, "clients", "ninja", "ninja")
+			if not (os.path.isfile(win) or os.path.isfile(unix)):
+				logger.info(
+					"未检测到 Ninja 内核（clients/ninja/）。若需测速 type:ninja 节点，"
+					"请按 clients/ninja/README.md 放置官方内核。"
+				)

@@ -205,7 +205,7 @@ class ParserClash:
 				ret = self.__convert_v2ray_cfg(cfg)
 			elif(_type == "trojan"):
 				ret = self.__convert_trojan_cfg(cfg)
-			elif _type in ("vless", "reality", "hysteria", "hysteria2", "hy", "hy2", "anytls", "tuic"):
+			elif _type in ("vless", "reality", "hysteria", "hysteria2", "hy", "hy2", "anytls", "tuic", "ninja"):
 				ret = deepcopy(cfg)
 				if "name" not in ret:
 					ret["name"] = ret.get("server", "N/A")
@@ -218,6 +218,11 @@ class ParserClash:
 					_type = "hysteria"
 				elif _type == "hy2":
 					_type = "hysteria2"
+				elif _type == "ninja":
+					from .ninja_util import normalize_ninja_proxy_fields
+
+					ret = normalize_ninja_proxy_fields(ret)
+					_type = "ninja"
 				ret["type"] = _type
 			else:
 				logger.error(f"Unspport type {_type}")

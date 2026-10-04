@@ -44,6 +44,8 @@ clients\mihomo\mihomo.exe version
 
 **建议**：使用与订阅节点特性匹配的较新 **Meta** 内核（需支持 SSR / vmess / trojan / vless 等你实际在用的协议）。
 
+若订阅含 **`type: ninja`**（Ninja 专有协议），公版 Mihomo 无法承载，请另备 [Ninja 内核](../ninja/README.md) 于 `clients/ninja/`。
+
 ## 运行时配置
 
 程序会将当前节点写成 `项目根目录/config_mihomo.yaml`，并以：

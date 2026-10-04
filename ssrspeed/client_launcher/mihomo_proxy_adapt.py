@@ -18,6 +18,7 @@ _MIHOMO_NATIVE_TYPES = frozenset(
 		"hy2",
 		"anytls",
 		"tuic",
+		"ninja",
 		"socks5",
 		"wireguard",
 		"snell",
@@ -317,9 +318,24 @@ def _native_mihomo_strip(cfg: dict) -> dict:
 	out.pop("local_port", None)
 	out.pop("remarks", None)
 	out.pop("group", None)
+	for key in list(out.keys()):
+		if str(key).startswith("_ninja"):
+			out.pop(key, None)
 	if "name" not in out or not out["name"]:
 		out["name"] = _proxy_name(cfg)
 	_ensure_port(out, cfg)
+	t = (out.get("type") or "").lower()
+	if t == "ninja":
+		# 内核必填 method + node-password。
+		# 混淆还原依赖 node_password（下划线）；仅写 node-password 时会还原出 port=0。
+		# 因此 hyphen / underscore 两种键必须同时保留。
+		np = out.get("node-password") or out.get("node_password")
+		if np not in (None, ""):
+			out["node-password"] = str(np)
+			out["node_password"] = str(np)
+		method = out.get("method") or out.get("cipher")
+		if method:
+			out["method"] = str(method)
 	return out
 
 
@@ -377,6 +393,19 @@ def config_to_mihomo_proxy(cfg: dict) -> dict:
 		out = _native_mihomo_strip(cfg)
 		if t == "ss" and out.get("plugin"):
 			out["plugin"] = _normalize_ss_plugin_for_mihomo(str(out["plugin"]))
+		if t == "ninja":
+			has_method = bool(out.get("method"))
+			has_np = bool(out.get("node-password") or out.get("node_password"))
+			if not has_method or not has_np:
+				# 混淆订阅可能在内核 ProcessNinjaObfuscation 后才还原必填字段
+				if cfg.get("_ninja_pass_info"):
+					logger.warning(
+						"ninja 节点暂缺 method/node-password，将依赖内核还原混淆字段后再测速。"
+					)
+				else:
+					if not has_method:
+						raise ValueError("ninja 节点缺少 method（加密方法）")
+					raise ValueError("ninja 节点缺少 node-password")
 		return _finalize_mihomo_proxy(out)
 
 	if _is_ssr_style(cfg):

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import glob
 import os
 import shutil
@@ -33,7 +34,7 @@ PORTABLE_DIR_NAME = "ProxySoru_portable"
 from env_cache import remove_pycache_trees
 from pip_requirements_install import DEFAULT_INDEX as _PIP_INDEX, install_requirements_check
 
-COPY_DIRS = ("ssrspeed", "clients", "tools", "resources")
+COPY_DIRS = ("ssrspeed", "clients", "tools", "resources", "colorlog")
 COPY_FILES = (
 	"main.py",
 	"config.py",
@@ -42,7 +43,6 @@ COPY_FILES = (
 	"config_mihomo.yaml.example",
 	"一键测速.bat",
 	"RUN_SPEED_TEST_ASCII.bat",
-	"ver.txt",
 	"README.md",
 )
 
@@ -150,6 +150,32 @@ def _pick_embed_url() -> tuple[str, str]:
 	_die("无法从 python.org 解析可用的 embeddable 版本。")
 
 
+def _read_project_version() -> str:
+	"""唯一版本源：仓库根目录 config.py 的 __version__。"""
+	config_py = os.path.join(ROOT_DIR, "config.py")
+	if not os.path.isfile(config_py):
+		_die("未找到 config.py，无法读取版本号。")
+	with open(config_py, encoding="utf-8", errors="replace") as f:
+		tree = ast.parse(f.read(), filename=config_py)
+	for node in tree.body:
+		if not isinstance(node, ast.Assign):
+			continue
+		for target in node.targets:
+			if isinstance(target, ast.Name) and target.id == "__version__":
+				ver = ast.literal_eval(node.value)
+				if isinstance(ver, str) and ver.strip():
+					return ver.strip()
+	_die("config.py 中未找到 __version__ 字符串。")
+
+
+def _write_portable_version_files(out_root: str) -> None:
+	ver = _read_project_version()
+	ver_txt = os.path.join(out_root, "ver.txt")
+	with open(ver_txt, "w", encoding="utf-8", newline="\n") as f:
+		f.write(ver + "\n")
+	print("[版本] ver.txt <- config.py __version__ = {}".format(ver), flush=True)
+
+
 def _copy_runtime_config(out_root: str) -> None:
 	"""便携包与仓库根目录使用同一份 ssrspeed_config.json，不做二次改写。"""
 	dst_cfg = os.path.join(out_root, "ssrspeed_config.json")
@@ -190,7 +216,17 @@ def _verify_portable_parity(out_root: str) -> None:
 		with open(adapt_py, encoding="utf-8", errors="replace") as f:
 			if "_normalize_ss_plugin_for_mihomo" not in f.read():
 				print("[警告] mihomo_proxy_adapt 可能缺少 obfs 插件映射，SS 节点或无法测速。", flush=True)
-	print("[校验] 便携包内容与仓库源码对齐检查完成。", flush=True)
+	expected_ver = _read_project_version()
+	portable_ver_txt = os.path.join(out_root, "ver.txt")
+	if os.path.isfile(portable_ver_txt):
+		with open(portable_ver_txt, encoding="utf-8", errors="replace") as f:
+			built_ver = f.read().strip()
+		if built_ver != expected_ver:
+			_die("便携包 ver.txt ({}) 与 config.py __version__ ({}) 不一致。".format(built_ver, expected_ver))
+	colorlog_init = os.path.join(out_root, "colorlog", "__init__.py")
+	if not os.path.isfile(colorlog_init):
+		_die("便携包缺少 colorlog/ 模块，控制台彩色日志将不可用。")
+	print("[校验] 便携包版本 {}，内容与仓库源码对齐检查完成。".format(expected_ver), flush=True)
 
 
 def _copy_project(out_root: str) -> None:
@@ -223,6 +259,7 @@ def _copy_project(out_root: str) -> None:
 
 	# 以仓库根目录 ssrspeed_config.json 为准覆盖（避免 COPY_FILES 中缺失或旧文件）
 	_copy_runtime_config(out_root)
+	_write_portable_version_files(out_root)
 
 	marker = os.path.join(out_root, "PORTABLE_BUILD")
 	with open(marker, "w", encoding="utf-8", newline="\n") as f:
@@ -252,6 +289,11 @@ def build(out_root: str, make_zip: bool) -> None:
 	if not os.path.isfile(os.path.join(ROOT_DIR, "requirements.txt")):
 		_die("未找到 requirements.txt，请在仓库根目录运行本脚本。")
 	_warn_if_path_has_non_ascii(ROOT_DIR, out_root)
+	project_ver = _read_project_version()
+	print("[版本] 打包版本（来自 config.py）: {}".format(project_ver), flush=True)
+	# 同步仓库根 ver.txt，避免与 config.py 脱节
+	with open(os.path.join(ROOT_DIR, "ver.txt"), "w", encoding="utf-8", newline="\n") as f:
+		f.write(project_ver + "\n")
 
 	if os.path.isdir(out_root):
 		print("[清理] {}".format(out_root), flush=True)

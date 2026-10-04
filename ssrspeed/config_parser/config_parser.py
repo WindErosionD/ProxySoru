@@ -4,6 +4,7 @@ import binascii
 from copy import deepcopy
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -15,7 +16,7 @@ import requests
 import yaml
 
 from ..utils import b64plus
-from ..utils.dns_resolve import subscription_resolve_entry
+from ..utils.dns_resolve import subscription_resolve_entry, system_dns_looks_like_fake_ip
 from ..types.nodes import NodeShadowsocks, NodeShadowsocksR, NodeV2Ray,NodeTrojan, NodeMihomo
 from .base_configs import shadowsocks_get_config, V2RayBaseConfigs
 from .shadowsocks_parsers import ParserShadowsocksBasic, ParserShadowsocksSIP002, ParserShadowsocksD
@@ -25,6 +26,20 @@ from .clash_parser import ParserClash
 from .node_filters import NodeFilter
 from .trojan_parser import TrojanParser
 from .singbox_parser import parse_singbox_subscription
+from .ninja_util import (
+	attach_pass_info,
+	diagnose_ninja_subscription_failure,
+	extract_ninja_pass_info,
+	looks_like_access_denied,
+	looks_like_cf_520,
+	looks_like_cf_challenge,
+	ninja_subscription_url_candidates,
+	NINJA_SUB_USER_AGENTS,
+	normalize_ninja_proxy_fields,
+	parse_ninja_link,
+	text_looks_like_ninja,
+	url_looks_like_ninja,
+)
 
 from config import config
 PROXY_SETTINGS = config["proxy"]
@@ -38,6 +53,7 @@ class UniversalParser:
 	def __init__(self):
 		self.__nodes = []
 		self.__ss_base_cfg = shadowsocks_get_config(LOCAL_ADDRESS, LOCAL_PORT, TIMEOUT)
+		self.__ninja_pass_info = ""
 
 	@property
 	def nodes(self):
@@ -156,6 +172,8 @@ class UniversalParser:
 			cfg["password"] = parsed.username or parsed.password or ""
 			cfg["sni"] = query.get("sni", [""])[0]
 			cfg["skip-cert-verify"] = self.__parse_bool(query.get("insecure", ["0"])[0])
+			cfg["client-fingerprint"] = query.get("fp", [""])[0] or "chrome"
+			cfg["udp"] = True
 		elif cfg_type == "tuic":
 			cfg["uuid"] = parsed.username or ""
 			cfg["password"] = parsed.password or query.get("password", [""])[0]
@@ -167,6 +185,16 @@ class UniversalParser:
 			cfg["skip-cert-verify"] = self.__parse_bool(query.get("allow_insecure", ["0"])[0])
 
 		return cfg
+
+	def __remember_ninja_pass_info(self, text: str):
+		info = extract_ninja_pass_info(text or "")
+		if info:
+			self.__ninja_pass_info = info
+			logger.info("Captured ninja pass-info comment(s) (%d chars).", len(info))
+
+	def __finalize_ninja_node_cfg(self, cfg: dict) -> dict:
+		cfg = normalize_ninja_proxy_fields(cfg)
+		return attach_pass_info(cfg, self.__ninja_pass_info)
 
 	def parse_links(self, links: list):
 		#Single link parse
@@ -246,6 +274,12 @@ class UniversalParser:
 				cfg = self.__parse_mihomo_link(link)
 				if cfg:
 					node = NodeMihomo(cfg)
+			elif link.startswith("ninja://"):
+				cfg = parse_ninja_link(link)
+				if cfg:
+					node = NodeMihomo(self.__finalize_ninja_node_cfg(cfg))
+				else:
+					logger.warning("Invalid ninja link: %s", link)
 			else:
 				logger.warn(f"Unsupport link: {link}")
 
@@ -270,14 +304,17 @@ class UniversalParser:
 				)
 			elif cfg["type"]=="trojan":
 				result.append(NodeTrojan(cfg["config"]))
-			elif cfg["type"] in ("vless", "hysteria", "hysteria2", "anytls", "tuic"):
-				if "remarks" not in cfg["config"]:
-					cfg["config"]["remarks"] = cfg["config"].get("name", cfg["config"].get("server", "N/A"))
-				if "group" not in cfg["config"]:
-					cfg["config"]["group"] = "N/A"
-				if "server_port" not in cfg["config"]:
-					cfg["config"]["server_port"] = cfg["config"].get("port", 0)
-				result.append(NodeMihomo(cfg["config"]))
+			elif cfg["type"] in ("vless", "hysteria", "hysteria2", "anytls", "tuic", "ninja"):
+				node_cfg = cfg["config"]
+				if cfg["type"] == "ninja":
+					node_cfg = self.__finalize_ninja_node_cfg(node_cfg)
+				if "remarks" not in node_cfg:
+					node_cfg["remarks"] = node_cfg.get("name", node_cfg.get("server", "N/A"))
+				if "group" not in node_cfg:
+					node_cfg["group"] = "N/A"
+				if "server_port" not in node_cfg:
+					node_cfg["server_port"] = node_cfg.get("port", 0)
+				result.append(NodeMihomo(node_cfg))
 
 		return result
 
@@ -308,7 +345,7 @@ class UniversalParser:
 		if not html_blob or len(html_blob) < 200:
 			return ""
 		pat = re.compile(
-			r"(?:vless|vmess|ss|ssr|trojan|hysteria2|hy2|tuic)://[^\s\"'<>\\)]+",
+			r"(?:vless|vmess|ss|ssr|trojan|hysteria2|hysteria|hy2|anytls|tuic|ninja)://[^\s\"'<>\\)]+",
 			re.I,
 		)
 		links = pat.findall(html_blob)
@@ -362,19 +399,92 @@ class UniversalParser:
 			pass
 		return ""
 
+	@staticmethod
+	def __extract_base64_payload_from_text(text: str) -> str:
+		"""从 HTML/混合文本中挖出可解码为节点链接的 Base64 段。"""
+		if not text or len(text) < 80:
+			return ""
+		compact = re.sub(r"\s+", "", text)
+		if len(compact) >= 80 and re.match(r"^[A-Za-z0-9+/=_-]+$", compact[:400]):
+			try:
+				dec = b64plus.decode(compact).decode("utf-8")
+				if "://" in dec:
+					return dec
+			except ValueError:
+				pass
+		for m in re.finditer(r"[A-Za-z0-9+/]{80,}={0,2}", text):
+			chunk = m.group()
+			try:
+				dec = b64plus.decode(chunk).decode("utf-8")
+				if "://" in dec:
+					return dec
+			except ValueError:
+				continue
+		return ""
+
+	def __recover_subscription_from_wrapped_text(self, text: str) -> str:
+		"""HTML/WAF/JSON 包裹层里尝试还原真实订阅正文。"""
+		if not text or not text.strip():
+			return ""
+		t = text.strip()
+		if self.__subscription_body_usable(t):
+			return t
+		for step in (
+			self.__extract_subscription_from_html_blob,
+			self.__extract_base64_payload_from_text,
+			self.__extract_share_links_from_html,
+			self.__unwrap_json_subscription_text,
+		):
+			try:
+				got = step(t)
+			except Exception:
+				got = ""
+			if got and got.strip():
+				if self.__subscription_body_usable(got) or "://" in got:
+					return got.strip()
+		return ""
+
+	def __subscription_fetch_proxies(self):
+		"""配置 proxy 优先；否则使用 Windows/系统 HTTP 代理（Clash 开「系统代理」时常有）。"""
+		cfg_px = self.__requests_proxies()
+		if cfg_px:
+			return cfg_px
+		try:
+			import urllib.request
+
+			px = urllib.request.getproxies() or {}
+			out = {}
+			http_px = (px.get("http") or "").strip()
+			https_px = (px.get("https") or "").strip()
+			if http_px:
+				out["http"] = http_px
+			if https_px:
+				out["https"] = https_px
+			elif http_px:
+				out["https"] = http_px
+			if out:
+				logger.info(
+					"Subscription fetch using OS system proxy: %s",
+					out.get("https") or out.get("http"),
+				)
+				return out
+		except Exception:
+			logger.debug("OS system proxy detection skipped.", exc_info=True)
+		return None
+
+	@staticmethod
+	def __curl_proxy_arg(proxies: Optional[dict]) -> str:
+		if not proxies:
+			return ""
+		return (proxies.get("https") or proxies.get("http") or "").strip()
+
 	def __fetch_subscription_via_session(self, url: str, verify: bool) -> str:
 		"""先访问站点根路径再拉订阅，部分 WAF 依赖 Cookie / Referer。"""
 		try:
 			p = urlparse(url)
 			base = "{}://{}".format(p.scheme, p.netloc)
 			s = requests.Session()
-			proxies = None
-			if PROXY_SETTINGS["enabled"]:
-				auth = ""
-				if PROXY_SETTINGS["username"]:
-					auth = "{}:{}@".format(PROXY_SETTINGS["username"], PROXY_SETTINGS["password"])
-				px = "socks5://{}{}:{}".format(auth, PROXY_SETTINGS["address"], PROXY_SETTINGS["port"])
-				proxies = {"http": px, "https": px}
+			proxies = self.__subscription_fetch_proxies()
 			browser = {
 				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -493,25 +603,16 @@ class UniversalParser:
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 		)
 		saw_transient = False
+		fetch_proxies = self.__subscription_fetch_proxies()
+		curl_proxy = self.__curl_proxy_arg(fetch_proxies)
 		for resolve in resolve_attempts:
 			for ua in uas:
 				try:
 					cmd = [curl_exe, "-sS", "-L", "--max-time", "28", "--compressed", "-w", "\n%{http_code}"]
 					if not verify:
 						cmd.append("-k")
-					if PROXY_SETTINGS["enabled"]:
-						auth = ""
-						if PROXY_SETTINGS["username"]:
-							auth = "{}:{}@".format(
-								PROXY_SETTINGS["username"],
-								PROXY_SETTINGS["password"],
-							)
-						px = "socks5h://{}{}:{}".format(
-							auth,
-							PROXY_SETTINGS["address"],
-							PROXY_SETTINGS["port"],
-						)
-						cmd.extend(["--proxy", px])
+					if curl_proxy:
+						cmd.extend(["--proxy", curl_proxy])
 					if resolve:
 						cmd.extend(["--resolve", resolve])
 					cmd.extend(["-H", "Accept: */*", "-A", ua, url])
@@ -536,6 +637,14 @@ class UniversalParser:
 						logger.warning("curl HTTP %s for UA [%s].", http_code, ua)
 						continue
 					if self.__looks_like_html_response(out):
+						recovered = self.__recover_subscription_from_wrapped_text(out)
+						if recovered:
+							logger.info(
+								"Recovered subscription from curl HTML wrapper (UA=%s, %d chars).",
+								ua,
+								len(recovered),
+							)
+							return recovered
 						logger.warning("curl returned HTML-like body (len=%d) for UA [%s].", len(out), ua)
 						continue
 					logger.info(
@@ -595,9 +704,8 @@ class UniversalParser:
 		verify: bool,
 		timeout: int,
 	) -> tuple:
-		proxies = self.__requests_proxies()
+		proxies = self.__subscription_fetch_proxies()
 		if proxies:
-			logger.info("Reading subscription via {}".format(proxies["https"]))
 			rep = requests.get(
 				url, headers=header, timeout=timeout, proxies=proxies, verify=verify
 			)
@@ -622,21 +730,39 @@ class UniversalParser:
 					status, text = self.__request_subscription_once(
 						url, header, verify, timeout
 					)
-					if status == 200 and self.__subscription_body_usable(text):
-						logger.info(
-							"Subscription fetched via requests (UA=%s), %d chars.",
-							header.get("User-Agent", "?"),
-							len(text),
-						)
-						return text
+					if status == 200 and text:
+						if self.__subscription_body_usable(text):
+							logger.info(
+								"Subscription fetched via requests (UA=%s), %d chars.",
+								header.get("User-Agent", "?"),
+								len(text),
+							)
+							return text
+						recovered = self.__recover_subscription_from_wrapped_text(text)
+						if recovered:
+							logger.info(
+								"Recovered subscription via requests (UA=%s), %d chars.",
+								header.get("User-Agent", "?"),
+								len(recovered),
+							)
+							return recovered
 					if self.__is_transient_http_error(status):
 						saw_transient = True
-					logger.warning(
-						"Subscription request not usable with UA [%s], status=%s, length=%d",
-						header.get("User-Agent", "?"),
-						status,
-						len(text),
-					)
+					if url_looks_like_ninja(url) or looks_like_access_denied(text) or looks_like_cf_520(text) or looks_like_cf_challenge(text):
+						logger.warning(
+							"Ninja subscription fetch failed (UA=%s, status=%s, len=%d): %s",
+							header.get("User-Agent", "?"),
+							status,
+							len(text),
+							diagnose_ninja_subscription_failure(status, text),
+						)
+					else:
+						logger.warning(
+							"Subscription request not usable with UA [%s], status=%s, length=%d",
+							header.get("User-Agent", "?"),
+							status,
+							len(text),
+						)
 					if (
 						self.__is_transient_http_error(status)
 						and attempt < retries_on_transient
@@ -679,20 +805,7 @@ class UniversalParser:
 			"safari17_0",
 			"chrome",
 		)
-		proxies = None
-		if PROXY_SETTINGS["enabled"]:
-			auth = ""
-			if PROXY_SETTINGS["username"]:
-				auth = "{}:{}@".format(
-					PROXY_SETTINGS["username"],
-					PROXY_SETTINGS["password"],
-				)
-			px = "socks5://{}{}:{}".format(
-				auth,
-				PROXY_SETTINGS["address"],
-				PROXY_SETTINGS["port"],
-			)
-			proxies = {"http": px, "https": px}
+		proxies = self.__subscription_fetch_proxies()
 		headers = {
 			"Accept": "*/*",
 			"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -701,6 +814,7 @@ class UniversalParser:
 		}
 		imp_list = impersonates if max_profiles is None else impersonates[:max_profiles]
 		saw_transient = False
+		best_wrapped = ""
 		for imp in imp_list:
 			try:
 				br_kw = dict(
@@ -722,19 +836,29 @@ class UniversalParser:
 				resp_sc = getattr(r, "status_code", 0)
 				text = (r.text or "").strip() if r is not None else ""
 				if resp_sc == 200 and text:
-					if self.__looks_like_html_response(text):
-						logger.warning(
-							"Browser-TLS fetch (%s) still looks like HTML/WAF (len=%d); trying next profile.",
+					if self.__subscription_body_usable(text):
+						logger.info(
+							"Subscription fetched via browser TLS impersonation (%s), %d chars.",
 							imp,
 							len(text),
 						)
-						continue
-					logger.info(
-						"Subscription fetched via browser TLS impersonation (%s), %d chars.",
+						return r.text or ""
+					recovered = self.__recover_subscription_from_wrapped_text(text)
+					if recovered:
+						logger.info(
+							"Recovered subscription via browser TLS (%s), %d chars.",
+							imp,
+							len(recovered),
+						)
+						return recovered
+					if len(text) > len(best_wrapped):
+						best_wrapped = text
+					logger.warning(
+						"Browser-TLS fetch (%s) still looks like HTML/WAF (len=%d); trying next profile.",
 						imp,
 						len(text),
 					)
-					return r.text or ""
+					continue
 				if self.__is_transient_http_error(resp_sc):
 					saw_transient = True
 				logger.warning(
@@ -745,22 +869,41 @@ class UniversalParser:
 				)
 			except Exception as e:
 				logger.warning("Browser-TLS fetch failed (%s): %s", imp, e.__class__.__name__)
+		if best_wrapped:
+			recovered = self.__recover_subscription_from_wrapped_text(best_wrapped)
+			if recovered:
+				logger.info(
+					"Recovered subscription from best browser-TLS HTML body (%d chars).",
+					len(recovered),
+				)
+				return recovered
 		return "transient" if saw_transient else ""
 
 	def __fetch_subscription_text(self, url: str) -> str:
 		# 部分机场对 python-requests 等 UA 返回 HTML/挑战页但仍为 200；勿在首次 200 就返回。
 		# sing-box / Clash 类订阅优先走轻量 requests，避免先连打 8 次 Browser-TLS 触发 502/限流。
 		ssl_state = {"had_ssl_failure": False}
+		# 普通机场按 Clash/Mihomo UA 下发完整节点；clash-ninja 常被当成未适配客户端，
+		# 只给少数地区 +「请更换客户端」占位节点。Ninja 订阅见下方 url_looks_like_ninja。
 		fast_headers = [
 			{"User-Agent": "Mihomo/1.18.0", "Accept": "*/*"},
 			{"User-Agent": "ClashMetaForAndroid/2.10.1.Meta", "Accept": "*/*"},
+			{"User-Agent": "clash-verge/v1.7.7", "Accept": "*/*"},
 			{"User-Agent": "sing-box/1.12.0", "Accept": "application/json,*/*"},
+			{"User-Agent": "clash-ninja/2.5.2", "Accept": "*/*"},
+			{"User-Agent": "Clash.Verge.Ninja/2.5.2", "Accept": "*/*"},
+			{"User-Agent": "clash-verge-ninja/2.5.2", "Accept": "*/*"},
 		]
 		header_candidates = [
+			{"User-Agent": "Mihomo/1.18.0", "Accept": "*/*"},
+			{"User-Agent": "ClashMetaForAndroid/2.10.1.Meta", "Accept": "*/*"},
 			{"User-Agent": "clash-verge/v1.7.7", "Accept": "*/*"},
 			{"User-Agent": "ClashForWindows/0.20.39", "Accept": "*/*"},
 			{"User-Agent": "FlClash/v0.8.0", "Accept": "*/*"},
 			{"User-Agent": "Stash/2.6.0", "Accept": "*/*"},
+			{"User-Agent": "clash-ninja/2.5.2", "Accept": "*/*"},
+			{"User-Agent": "clash-ninja/2.5.2 pass 1.0", "Accept": "*/*"},
+			{"User-Agent": "Clash.Verge.Ninja/2.5.2", "Accept": "*/*"},
 			{"User-Agent": "curl/8.7.1", "Accept": "*/*"},
 			{"User-Agent": "python-requests/2.31.0", "Accept": "*/*"},
 			{
@@ -768,6 +911,11 @@ class UniversalParser:
 				"Accept": "text/plain,application/yaml,text/yaml,application/json,text/html;q=0.8,*/*;q=0.5",
 			},
 		]
+		if url_looks_like_ninja(url):
+			# Clash Verge Ninja 2.5.2 内嵌 UA：clash-ninja/2.5.2 pass 1.0
+			ninja_headers = [{"User-Agent": ua, "Accept": "*/*"} for ua in NINJA_SUB_USER_AGENTS]
+			fast_headers = ninja_headers + [h for h in fast_headers if h not in ninja_headers]
+			header_candidates = ninja_headers + [h for h in header_candidates if h not in ninja_headers]
 		last_200_text = ""
 		saw_transient = False
 		resolve_entry = None
@@ -775,10 +923,29 @@ class UniversalParser:
 			resolve_entry = subscription_resolve_entry(url)
 			if resolve_entry:
 				logger.info("Subscription host pinned via DoH (--resolve / CURLOPT_RESOLVE): %s", resolve_entry)
+			else:
+				try:
+					host = (urlsplit(url).hostname or "").strip()
+					if host and system_dns_looks_like_fake_ip(host):
+						logger.warning(
+							"【订阅 DNS】%s 被解析到 fake-ip（常见于 Mihomo/Clash 开 TUN）。"
+							"请暂时关闭系统代理/TUN，或在 ssrspeed_config.json 里开启 proxy 用本地 SOCKS 拉订阅。",
+							host,
+						)
+				except Exception:
+					pass
 		except Exception:
 			logger.debug("Subscription DoH resolve skipped.", exc_info=True)
 		perf = config.get("performance") or {}
 		sub_http_to = int(perf.get("subscription_http_timeout", 22))
+
+		os_proxy = self.__subscription_fetch_proxies()
+		if os_proxy and not PROXY_SETTINGS["enabled"]:
+			br_early = self.__fetch_subscription_via_browser_tls(
+				url, verify=True, resolve_entry=None, max_profiles=3
+			)
+			if br_early and br_early != "transient":
+				return br_early
 
 		for verify in (True, False):
 			if not verify:
@@ -796,6 +963,19 @@ class UniversalParser:
 			if req_text == "transient":
 				saw_transient = True
 
+			if resolve_entry:
+				curl_text = self.__fetch_subscription_via_system_curl(url, verify, resolve_entry)
+				if curl_text and curl_text != "transient":
+					last_200_text = curl_text
+					if self.__subscription_body_usable(curl_text):
+						return curl_text
+					logger.warning(
+						"System curl (DoH pin) body still looks like HTML/WAF (%d bytes).",
+						len(curl_text),
+					)
+				if curl_text == "transient":
+					saw_transient = True
+
 			br_profiles = 2 if saw_transient else None
 			for resolve in ([resolve_entry, None] if resolve_entry else [None]):
 				if resolve is None and resolve_entry:
@@ -805,12 +985,7 @@ class UniversalParser:
 				)
 				if br_text and br_text != "transient":
 					last_200_text = br_text
-					if self.__subscription_body_usable(br_text):
-						return br_text
-					logger.warning(
-						"Browser-TLS body still looks like HTML/WAF (len=%d); trying requests/curl.",
-						len(br_text),
-					)
+					return br_text
 				if br_text == "transient":
 					saw_transient = True
 
@@ -860,6 +1035,13 @@ class UniversalParser:
 					return final
 
 		if last_200_text.strip():
+			recovered = self.__recover_subscription_from_wrapped_text(last_200_text)
+			if recovered:
+				logger.info(
+					"Recovered subscription from last HTTP body (%d chars).",
+					len(recovered),
+				)
+				return recovered
 			logger.warning(
 				"Using last HTTP 200 body (%d bytes) despite HTML/WAF heuristics; will try parse / HTML unwrap.",
 				len(last_200_text),
@@ -872,6 +1054,11 @@ class UniversalParser:
 			)
 		else:
 			logger.error("Subscription request failed after retries.")
+			logger.error(
+				"【说明】未能下载订阅内容（常见原因：① Clash/Mihomo TUN 把域名解析到 fake-ip；"
+				"② 直连 TLS 被重置）。可行做法：浏览器（走代理）打开订阅链接，内容另存为 sub.txt，"
+				"测速时直接输入该文件完整路径；或关闭 TUN 后在 ssrspeed_config.json 开启 proxy。"
+			)
 		return ""
 	
 	def filter_nodes(self, fk=[], fgk=[], frk=[], ek=[], egk=[], erk=[]):
@@ -906,23 +1093,81 @@ class UniversalParser:
 				url.startswith("hysteria2://") or
 				url.startswith("anytls://") or
 				url.startswith("tuic://") or
-				url.startswith("reality://")
+				url.startswith("reality://") or
+				url.startswith("ninja://")
 			):
 				self.__nodes.extend(self.parse_links([url]))
 				continue
 
-			logger.info("Reading {}".format(url))
-			rep = self.__fetch_subscription_text(url)
+			local_path = ""
+			if url.startswith("file://"):
+				parsed_file = urlparse(url)
+				local_path = unquote(parsed_file.path)
+				if os.name == "nt" and local_path.startswith("/") and len(local_path) > 2 and local_path[2] == ":":
+					local_path = local_path.lstrip("/")
+			elif os.path.isfile(url):
+				local_path = url
+
+			if local_path:
+				logger.info("Reading subscription from local file: %s", local_path)
+				try:
+					with open(local_path, "r", encoding="utf-8-sig") as f:
+						rep = f.read()
+				except OSError as e:
+					logger.error("Cannot read local subscription file %s: %s", local_path, e)
+					continue
+			else:
+				logger.info("Reading {}".format(url))
+				candidates = (
+					ninja_subscription_url_candidates(url)
+					if url_looks_like_ninja(url)
+					else [url]
+				)
+				rep = ""
+				for cand in candidates:
+					if cand != url:
+						logger.info("Trying ninja subscription URL candidate: %s", cand)
+					got = self.__fetch_subscription_text(cand)
+					if not (got or "").strip():
+						continue
+					rep = got
+					# 可用正文或非 WAF/HTML 挑战页时停止换源
+					if self.__subscription_body_usable(got.strip()):
+						break
+					if not (
+						self.__looks_like_html_response(got)
+						or looks_like_access_denied(got)
+						or looks_like_cf_520(got)
+						or looks_like_cf_challenge(got)
+					):
+						break
+					logger.warning(
+						"Candidate unusable: %s",
+						diagnose_ninja_subscription_failure(0, got),
+					)
 			if not rep.strip():
-				logger.error("Subscription response is empty.")
+				if url_looks_like_ninja(url):
+					logger.error(
+						"Ninja subscription empty/unusable. "
+						"Remote often returns Access denied / CF 520 / challenge. "
+						"Open the link in Clash Verge Ninja, export YAML, then: "
+						"python main.py -u path\\to\\sub.yaml"
+					)
+				else:
+					logger.error("Subscription response is empty.")
 				continue
 
 			rep = rep.strip()
+			if url_looks_like_ninja(url) or text_looks_like_ninja(rep):
+				self.__remember_ninja_pass_info(rep)
+				logger.info("Ninja subscription detected; will prefer ninja core for nodes.")
 			if rep.lstrip("\ufeff").startswith("<"):
 				extracted = self.__extract_subscription_from_html_blob(rep)
 				if extracted:
 					logger.info("Extracted subscription payload from HTML wrapper (%d bytes).", len(extracted))
 					rep = extracted
+					if text_looks_like_ninja(rep):
+						self.__remember_ninja_pass_info(rep)
 
 			unwrapped = self.__unwrap_json_subscription_text(rep)
 			if unwrapped and unwrapped != rep:
@@ -1061,6 +1306,8 @@ class UniversalParser:
 		raw_data = ""
 		with open(filename, "r", encoding="utf-8") as f:
 			raw_data = f.read()
+		if text_looks_like_ninja(raw_data):
+			self.__remember_ninja_pass_info(raw_data)
 		try:
 			#Try Load as Json
 			data = json.loads(raw_data)
